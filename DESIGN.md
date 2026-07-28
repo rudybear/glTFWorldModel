@@ -1,6 +1,6 @@
 # DESIGN
 
-Status: 2026-07-28, milestone V5.
+Status: 2026-07-28, milestone V6.
 
 ## Architecture flow
 
@@ -483,7 +483,11 @@ model milestone lined up, so dynamics moved first.
   to train a dynamics model against before `perception-v1` had an
   equivalent model milestone ready to build on. See "Dynamics model (V5)"
   below and `docs/VERIFICATION.md`'s V5 section.
-- **V6** — perception model: frames -> scene state.
+- **V6** (code delivered + smoke-tested; full training out of this
+  milestone's scope, see below) — perception model: single RGB frame ->
+  scene state (`PerceptionDETR`) + Hungarian matching/set loss +
+  training/eval harness. See "Perception model (V6)" below and
+  `docs/VERIFICATION.md`'s V6 section.
 - **V7** — inference loop: model output -> glTF -> renderer, closed loop.
 - **V8** — external eval anchor: Physion replication (the primary
   *external* correctness anchor for this project's eval numbers, per V4's
@@ -788,3 +792,187 @@ a single 1/30s step is dominated by the ballistic term either way,
 un-surprising this early and this undertrained); h=1/10 pass the same
 "model <= ballistic" bar at full training convergence is expected to
 widen, not close, given h=30/h=99's trend.
+
+## Perception model (V6)
+
+`gltfworld.models.perception.PerceptionDETR` predicts `frame -> set of
+objects` (pose, size, shape, semantic class, existence) directly from a
+single rendered RGB frame; `gltfworld.models.matching` holds Hungarian
+matching + the symmetry-aware set-prediction loss; `gltfworld.train
+.train_perception` trains it with a `train_dynamics`-style harness (config
+dataclass, resumable, `--smoke`, `log.csv`, safetensors checkpoints);
+`gltfworld.eval.perception_eval` evaluates a checkpoint (existence PR/F1,
+matched pose/size/shape/class error, a mean-state baseline, and a GPU
+re-render PSNR/SSIM check) and re-exports predictions as real glTF, per this
+project's "inference emits glTF at every hop" principle.
+
+### `PerceptionDETR` (~8.2M params -- see "documented parameter-count
+deviation" below)
+
+A DETR-lite (Carion et al. 2020's set-prediction recipe, scaled down):
+
+- **Patch embed**: `256x256x3` RGB (normalized from `PerceptionDataset`'s
+  `[0, 1]` range to `[-1, 1]` *inside* the model, not by the caller) -> one
+  non-overlapping `16x16` patch per token via a single strided `Conv2d`
+  (equivalent to a per-patch linear projection) -> 256 tokens, plus a
+  learned per-token 2D positional embedding.
+- **Encoder**: 6 pre-norm `nn.TransformerEncoderLayer`s, `d_model=256`, 8
+  heads, MLP ratio 4 -- architecturally the same recipe as `gltfworld.models
+  .dynamics.InteractionTransformer`'s stack, just over image-patch tokens.
+- **Decoder**: `N_MAX=5` learned object-query tokens (fixed per-slot
+  embeddings, not derived from the image -- standard DETR), 3 pre-norm
+  `nn.TransformerDecoderLayer`s (self-attention across queries + cross-
+  attention to the encoder's image tokens), same `d_model`/heads/MLP ratio.
+- **Heads** (one shared 2-layer MLP trunk, split by output field):
+  existence logit (1); position (3, workspace-normalized via a sigmoid
+  affinely mapped into a fixed `[POS_MIN, POS_MAX]` box with margin over
+  `wm-scenes-v1`'s actual sampled range, then denormalized -- that mapped
+  value *is* the final world-unit position); rotation as a 6D representation
+  -> quaternion via `gltfworld.models.rotations.sixd_to_quat` (continuous,
+  no double-cover discontinuity as a regression target); size (3, same
+  sigmoid-into-a-box scheme, `[SIZE_MIN, SIZE_MAX]`); shape logits (3, order
+  matches `gltfworld.scene.contract.SHAPE_ORDER`); class logits (3, order
+  matches `gltfworld.scene.contract.CATEGORY_TO_CLASS_ID`).
+
+**Documented parameter-count deviation** (same precedent as V5's
+`NoInteractionMLP`): the milestone spec text's own approximate "~12-16M"
+target and the literal architecture description above (patch16/256 tokens,
+6 encoder + 3 decoder layers, `d_model=256`, 8 heads, MLP ratio 4, 5
+queries) aren't simultaneously satisfiable -- the literal architecture, as
+specified, measures smaller. Per this project's stated policy (prefer the
+literal, testable architecture description over an approximate headline
+number rather than padding hidden dims solely to hit a target the
+component list doesn't otherwise ask for), the architecture was implemented
+exactly as specified. Measured (`python -m gltfworld.models.perception`,
+this machine): **8,234,259** parameters.
+
+### Matching + symmetry-aware loss (`gltfworld.models.matching`)
+
+- **Hungarian matching** (`hungarian_match`, `scipy.optimize
+  .linear_sum_assignment` -- exact, not an approximation): per sample, a
+  cost matrix `(N_MAX queries) x (n_real GT objects)` from
+  `w_pos * L2(position) + w_cls * CE(class) + w_size * L2(size)`, restricted
+  to that sample's existence-eligible (`mask`) GT rows only -- a padded/
+  nonexistent GT slot can never be matched against. Queries beyond the real
+  GT count are left unmatched.
+- **Losses on matched pairs**: position MSE and size MSE (both normalized
+  by the same `POS_SCALE`/`SIZE_SCALE`-style constants
+  `InteractionTransformer`'s own features use, for a commensurate loss
+  scale), shape CE, class CE, and a **symmetry-aware rotation loss**
+  (`symmetry_rotation_loss`, squared symmetry-aware angle -- same
+  squared-geodesic-angle convention `train_dynamics.compute_losses` uses):
+  - **sphere**: always 0 -- a sphere has continuous rotational symmetry
+    about every axis, so there is no orientation to supervise at all.
+  - **box**: the minimum geodesic angle (`gltfworld.models.rotations
+    .quat_geodesic_angle`) between the predicted quaternion and the GT
+    quaternion composed with each of the cube's **24** rotational
+    symmetries (`CUBE_SYMMETRY_QUATS`, precomputed once at import time from
+    the 24 proper, `det=+1`, signed-permutation matrices of R^3 -- not
+    data-fit).
+  - **cylinder**: `axis_alignment_angle` compares only the predicted-vs-GT
+    local **Y** axis direction (`R(q) @ (0, 1, 0)`, per `ObjectSpec`'s
+    documented cylinder convention), sign-aligned before measuring the
+    angle between them -- invariant to spinning about that axis (doesn't
+    change the axis direction at all) *and* to the 180-degree end-swap flip
+    (negates the axis direction, which sign-alignment cancels) simultaneously,
+    for free.
+
+  Both symmetry angles use the same `atan2`-of-norms form
+  `quat_geodesic_angle` does (rather than `arccos`), for the identical
+  well-behaved-gradient-near-zero reason documented there.
+- **Unmatched queries**: existence BCE target 0; matched queries: target 1.
+  All loss weights are configurable (`gltfworld.train.train_perception
+  .Config`).
+- Unit tests (`tests/test_matching.py`) prove each symmetry directly: a box
+  rotated by any of its 24 symmetries -> rotation loss ~0 (and a genuinely
+  different orientation is *not* near-zero, so the test isn't vacuous); a
+  cylinder spun about its own local-Y axis -> ~0, flipped 180 degrees -> ~0
+  (and a genuinely tilted axis is *not* near-zero); a sphere's rotation loss
+  is exactly 0 regardless of how different the predicted and GT quaternions
+  are.
+
+### Training harness (`gltfworld.train.train_perception`)
+
+Shares `train_dynamics`'s harness *contract* (JSON-loadable `Config`
+dataclass, resumable checkpoints with matching `.train_state.pt`,
+`--smoke`, `log.csv`, `step_{N:07d}.safetensors`/`best`/`last`
+checkpoints) but is a simpler single-phase schedule -- there is no analogue
+of the dynamics model's autoregressive rollout finetune phase here (a
+single-frame perception model has no rollout to finetune against).
+
+- AdamW, `lr=2e-4` cosine-annealed to a floor, batch 128, default 25k steps,
+  bf16 autocast, grad-norm clip 1.0.
+- **Data loading**: unlike `train_dynamics`'s fully-in-VRAM vectorized
+  samplers, `perception-v1`'s rendered RGB frames are too large to
+  preload an entire split into VRAM up front, so training uses an ordinary
+  `torch.utils.data.DataLoader` over `gltfworld.data.dataset
+  .PerceptionDataset` (shuffled, worker-process I/O over the
+  memory-mapped `rgb.npy` files) wrapped in a small infinite-iterator
+  helper, rather than a custom sampler.
+- **Augmentation, RGB only** (`augment_rgb`): brightness jitter, contrast
+  jitter, and additive Gaussian noise, clamped back to `[0, 1]`. State
+  targets (position/rotation/size/shape/class) are never touched by this --
+  the perception task must stay geometrically truthful even while its
+  *appearance* robustness is trained up.
+- **Val** (every 1k steps by default): total + per-component loss, plus a
+  quick matched-position-error (median, over Hungarian-matched pairs) as a
+  human-readable sanity signal alongside the raw loss.
+- **`--smoke`**: 500 steps, tiny val subset, asserts the EMA-smoothed
+  (decay 0.98) training loss dropped >= 30% (same early-vs-final-window
+  convention `train_dynamics --smoke` uses, for the same "single-batch loss
+  variance dominates the raw per-step signal at this budget" reason).
+  Measured on the real `perception-v1` packed dataset (RTX PRO 6000
+  Blackwell): **19.0% raw / 33.2% EMA** drop in **136.5s** (well under the
+  5-minute budget) -- see `docs/VERIFICATION.md`'s V6 section for the full
+  printed curve.
+
+### Eval (`gltfworld.eval.perception_eval`)
+
+    uv run python -m gltfworld.eval.perception_eval \
+        --ckpt runs/perception-v1/best.safetensors \
+        --data data/perception-v1 --split test \
+        --out runs/perception-v1/eval
+
+- **Existence**: precision/recall/F1 at a 0.5 threshold (a query is a true
+  positive iff it is both the Hungarian-assigned match for a real GT object
+  *and* thresholded "existent"; a false positive is an *unmatched* query
+  thresholded existent; a false negative is a real GT object whose matched
+  query fell below threshold), plus a full 101-point PR curve.
+- **Per-N breakdown** (N = 1..5 real objects/frame): existence F1 and
+  matched position error within each group.
+- **Matched pose/size/shape/class metrics**: computed over every
+  Hungarian-matched pair, independent of the existence threshold (a
+  pose-quality metric, not a detection metric -- same convention
+  `gltfworld.eval.rollout` uses). Rotation error is the same symmetry-aware
+  angle the loss uses, reported in degrees, split by GT shape (sphere rows
+  excluded -- nothing meaningful to score).
+- **Count-exact-match rate**: fraction of frames where the thresholded
+  predicted-object count equals the real GT count.
+- **Mean-state baseline**: a zero-learning dummy predictor (always predicts
+  the train-split's mean real-object count, all at the train-split mean
+  position/size and the modal shape/class, never looking at the image at
+  all) run through the identical metrics pipeline, so the trained model's
+  numbers are read against a trivial prior rather than in a vacuum.
+- **Re-render check** (`--render-samples K`, default 50, needs the `render`
+  extra + GPU): for K sampled test frames, builds a predicted single-frame
+  `Episode` from every existence-thresholded query (predicted pose/size/
+  shape; color/material copied from the GT `ObjectSpec` of that query's
+  Hungarian-*matched* real object -- an intentionally honest GT-assist,
+  documented as such, since `PerceptionDETR` never predicts color/material
+  and this check's purpose is only to sanity-check geometry rendering
+  fidelity; an unmatched thresholded query, i.e. a false positive, gets a
+  fixed neutral-gray fallback instead, since there is no GT object to copy
+  from), renders it, and compares PSNR/SSIM against the actual stored GT
+  frame. Predicted frames are saved as real, independently loadable
+  `pred_frames/ep_XXXXXX_fYYYY.glb` (`T=1`), round-trip verified inline
+  (`<= 1e-6`), and run through the real, pinned glTF-Validator.
+
+### Acceptance (see `docs/VERIFICATION.md`'s V6 section for exact commands)
+
+On the `perception-v1` test split: existence F1 >= 0.95, median matched
+position error <= 0.05 m, class accuracy >= 0.95. Per this milestone's own
+scope boundary, the full 25k-step training run is the orchestrator's to run
+(not run here); if the trained model's numbers miss this bar, that is to be
+reported honestly and recorded in `docs/RESULTS.md` rather than hidden --
+same policy `docs/VERIFICATION.md`'s V5 section already established for the
+dynamics model.

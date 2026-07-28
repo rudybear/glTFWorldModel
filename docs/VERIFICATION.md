@@ -857,3 +857,229 @@ is documented honestly in RESULTS.md per project policy.
   milestone's own rules, **no commit here is pushed**, so (as recorded
   honestly in V4's own CI checkpoint) the last actually-pushed commit's CI
   run predates this fix and is unaffected either way.
+
+## V6 -- perception model + Hungarian matching + training/eval code
+
+Needs the `ml` extra (already synced by V5, no new dependency added this
+milestone -- `scipy.optimize.linear_sum_assignment` reuses the same
+`scipy` `ml`-extra dependency V5's rotation-math cross-checks already
+depend on). The training smoke and eval CLI additionally need the real
+`perception-v1` dataset (`data/perception-v1/`, git-ignored, generated per
+`data/README.md`) plus `--extra render --extra sim` for the GPU-only
+checkpoints (rendering/EGL). See DESIGN.md's "Perception model (V6)"
+section for the full architecture/training-harness writeup this section
+verifies against.
+
+### Checkpoint: symmetry-aware rotation loss (the correctness-critical part)
+
+- **Purpose**: confirm the cube's rotational symmetry group is genuinely 24
+  proper (orthogonal, `det=+1`) and pairwise-distinct rotations; confirm the
+  box rotation loss is ~0 for a prediction equal to the GT composed with
+  *any* of those 24 symmetries, and *not* near-zero for a genuinely
+  different orientation (so the zero-loss checks aren't vacuously trivial);
+  confirm the cylinder axis-alignment loss is ~0 for a spin about the
+  object's own local-Y symmetry axis and for a 180-degree end-swap flip,
+  and *not* near-zero for a genuinely tilted axis; confirm a sphere's
+  rotation loss is exactly 0 regardless of how different the predicted and
+  GT quaternions are.
+- **Command**: `uv run pytest tests/test_matching.py -v`
+- **Expected result**: all 16 tests pass. Observed: **16/16 pass**.
+
+### Checkpoint: Hungarian matching correctness (incl. distractor queries)
+
+- **Purpose**: confirm the matching cost/assignment picks the obviously-
+  correct query<->GT pairing (not just *a* valid assignment) on a hand-built
+  case with 3 real GT objects, 2 correct predicted queries per object, and
+  2 far-away distractor queries that must end up unmatched; confirm a
+  frame with 0 real GT objects returns an empty match with no error.
+- **Command**: `uv run pytest tests/test_matching.py -k hungarian -v`
+- **Expected result**: 2/2 pass (subset of the 16 above).
+
+### Checkpoint: model shapes/finiteness + parameter count
+
+- **Purpose**: confirm `PerceptionDETR.forward` produces the documented
+  output shapes for every field, all finite; confirm the quaternion output
+  is genuinely unit-norm and hemisphere-normalized; confirm position/size
+  outputs stay within their documented workspace bounds; confirm batch
+  independence (no accidental cross-sample leakage); confirm a wrong input
+  image size is rejected rather than silently misbehaving; print/sanity-
+  check the parameter count.
+- **Command**: `uv run pytest tests/test_perception_model.py -v` and
+  `uv run python -m gltfworld.models.perception`
+- **Expected result**: all 7 tests pass. Observed: **7/7 pass**. Printed
+  param count: **8,234,259** -- see DESIGN.md's "documented parameter-count
+  deviation" note (the milestone spec's own approximate "~12-16M" target and
+  the literal architecture description aren't simultaneously satisfiable;
+  same precedent as V5's `NoInteractionMLP`).
+
+### Checkpoint: eval metrics correctness (perfect-prediction + known-corruption cases)
+
+- **Purpose**: confirm `compute_metrics` reports F1=1, 0 position/size/
+  rotation error, 100% shape/class accuracy, and a 100% count-exact-match
+  rate on a synthetic *perfect* prediction; confirm a hand-built mixed
+  true-positive/false-positive/false-negative case reports the expected
+  precision/recall exactly (0.5/0.5); confirm sphere rows are excluded from
+  the rotation-error stats entirely (`n=0`), regardless of how wrong the
+  predicted quaternion is; confirm a known, injected 5cm position offset on
+  every matched prediction is reported back as a ~5cm median position
+  error -- this validates the *metric computation itself*, independent of
+  any trained model; confirm `build_predicted_episode` (the re-render
+  check's `Episode` builder) round-trips through `save_episode`/
+  `load_episode` to `<= 1e-6`, for both the ordinary (GT-matched color) case
+  and the false-positive (default-color fallback) case.
+- **Command**: `uv run pytest tests/test_perception_eval.py -v`
+- **Expected result**: all 6 tests pass. Observed: **6/6 pass**.
+
+### Checkpoint: training harness smoke (gpu, real `perception-v1` data)
+
+- **Purpose**: confirm the training harness -- `PerceptionDataset` loading
+  (real rendered frames, not a synthetic fixture), RGB-only augmentation,
+  Hungarian matching, bf16 autocast, checkpoint IO -- works end-to-end
+  against the real packed `perception-v1` dataset, and that 500 steps
+  measurably drops the (EMA-smoothed) training loss within the 5-minute
+  budget.
+- **Command**:
+
+  ```bash
+  uv run python -m gltfworld.train.train_perception \
+      --config configs/perception_v1.json --out /tmp/perception-v1-smoke --smoke
+  ```
+
+  or as a pytest (skips cleanly if `data/perception-v1/packed/` isn't
+  present locally): `uv run pytest tests/test_train_perception_smoke.py -v -m gpu -s`
+- **Expected result**: exits 0. Measured on this machine (RTX PRO 6000
+  Blackwell), `PerceptionDETR` (8,234,259 params): **19.0% raw / 33.2% EMA**
+  loss drop in **136.5s** -- comfortably clears the 30% bar, well under the
+  5-minute budget. Full printed curve:
+
+  ```
+  model=PerceptionDETR device=cuda params=8,234,259
+  step 100/500 train_loss=2.05505 val_loss=2.15920 matched_pos_err=0.7584m elapsed=27.7s
+  step 200/500 train_loss=2.24856 val_loss=2.16282 matched_pos_err=0.7507m elapsed=54.8s
+  step 300/500 train_loss=2.03515 val_loss=2.06810 matched_pos_err=0.7445m elapsed=81.9s
+  step 400/500 train_loss=2.11222 val_loss=2.09216 matched_pos_err=0.7702m elapsed=109.3s
+  step 500/500 train_loss=1.94137 val_loss=2.17090 matched_pos_err=0.7629m elapsed=136.5s
+  smoke: raw start_loss=2.52709 end_loss=2.04675 drop=19.0%
+  smoke: ema start_loss=3.06045 end_loss=2.04316 drop=33.2%
+  SMOKE PASS
+  ```
+
+  The high matched-position-error (~0.75m) after only 500 steps is
+  expected and not a bug: `matched_pos_err` is a raw median position error
+  in meters over an essentially-untrained 500-step model (the milestone's
+  own scope boundary is "deliver + smoke-test the training code", not
+  "train to convergence" -- see the acceptance-bar checkpoint below for
+  what the *full* run needs to clear).
+
+### Checkpoint: full training run command (for the orchestrator)
+
+- **Purpose**: the exact command the orchestrator runs to actually train
+  the shipped `perception-v1` model to completion -- **not run as part of
+  this milestone** (V6 delivers and smoke-tests the training code; the full
+  run is explicitly out of scope here, per this milestone's own rules,
+  mirroring V5's identical scope boundary for the dynamics model).
+- **Command**:
+
+  ```bash
+  uv run python -m gltfworld.train.train_perception \
+      --config configs/perception_v1.json --out runs/perception-v1
+  ```
+
+  Resumable (`--resume`) if interrupted; `runs/` is git-ignored, so no run
+  artifacts are committed regardless.
+
+### Checkpoint: eval CLI end-to-end (gpu, metrics + re-render + glTF-at-every-hop)
+
+- **Purpose**: confirm the eval CLI end-to-end against real data -- model
+  inference, Hungarian matching, the mean-state baseline (run through the
+  identical metrics pipeline for comparison), and the GPU re-render check
+  (predicted-`Episode` construction, rendering, PSNR/SSIM against the real
+  stored GT frame, the inline `<= 1e-6` round trip, and a clean run through
+  the real, pinned glTF-Validator) -- using a freshly-initialized (untrained)
+  checkpoint, since this milestone doesn't run the full training (see
+  above); this checkpoint is about the *pipeline* working end-to-end on
+  real data, not about reporting trained-model quality numbers.
+- **Command**:
+
+  ```bash
+  uv run python -m gltfworld.eval.perception_eval \
+      --ckpt runs/perception-v1/best.safetensors \
+      --data data/perception-v1 --split test \
+      --out runs/perception-v1/eval
+  ```
+
+- **Expected result**: writes `metrics.json`, `metrics.md`, and
+  `pred_frames/ep_XXXXXX_fYYYY.glb` files for the sampled re-render frames;
+  exits 0.
+- **Test-suite split, and a real bug this caught**: `tests/
+  test_perception_eval_gpu.py` exercises this in two separate tests rather
+  than one call to `main()`, and for a real reason found while writing it:
+  `render_check`'s first version unconditionally built *and deleted* its
+  own `EpisodeRenderer` (mirroring `gltfworld.eval.rollout
+  ._render_side_by_side_videos`'s existing pattern) -- fine as a genuinely
+  standalone CLI process, but fatal inside the shared pytest session, where
+  `tests/test_data.py::test_perception_dataset_reads_rendered_frames`
+  already holds the session-scoped `episode_renderer` fixture open (see
+  `EpisodeRenderer`'s own documented "one live renderer per process"
+  constraint: deleting *any* instance terminates the *shared* EGL display
+  for every other still-open instance in the process). This surfaced as a
+  session-teardown `EGL_NOT_INITIALIZED` crash in that unrelated fixture,
+  not a failure in the new test itself -- exactly the class of bug that
+  constraint's docstring warns about. Fixed by giving `render_check` an
+  optional `renderer=` parameter (only builds/deletes its own when none is
+  supplied); `test_perception_eval_cli_metrics_and_baseline` exercises
+  `main()` with `--render-samples 0` (metrics/baseline pipeline only, no
+  renderer involved at all), and `test_render_check_with_shared_renderer`
+  calls `render_check` directly with the shared `episode_renderer` fixture
+  (3 render samples, to stay fast) and then confirms that shared renderer
+  is still usable afterward. `main()`'s own `--render-samples` path (used
+  above) still builds/deletes its own renderer, correct for the real
+  standalone-process case the CLI actually runs in.
+- **Expected result / observed**: both tests pass; round trip `<= 1e-6`,
+  glTF-Validator clean, PSNR/SSIM computed successfully (measured on this
+  machine against a freshly-initialized checkpoint: PSNR median ~24.5 dB,
+  SSIM median ~0.97 -- expected to be unremarkable at this stage since
+  background/camera/ground dominate the frame and the object appearance
+  itself is a documented GT-assist, see DESIGN.md; this number is not a
+  claim about geometric prediction accuracy, which the matched-pose metrics
+  above already cover separately).
+
+### Acceptance (see DESIGN.md's "Perception model (V6)" section)
+
+On the `perception-v1` test split: existence F1 >= 0.95, median matched
+position error <= 0.05 m, class accuracy >= 0.95. **Not yet measured against
+a fully-trained checkpoint** -- per this milestone's own scope boundary
+(training code delivered + smoke-tested here; the full 25k-step run is the
+orchestrator's to execute separately, exactly like V5's dynamics model). If
+the trained model's numbers miss this bar once the full run completes, that
+finding is to be reported honestly and recorded in `docs/RESULTS.md` rather
+than hidden or silently re-tuned away.
+
+### Checkpoint: full test suite
+
+- **Purpose**: confirm this milestone didn't regress anything upstream and
+  that everything new is exercised.
+- **Command**: `uv run pytest -v -m "not gpu"` (CI-equivalent) and
+  `uv run pytest -v` (full, local, GPU machine only).
+- **Expected result / observed**: **197 passed, 13 deselected** (not-gpu, up
+  from V5's 168/10 -- 4 new CPU-fast test files this milestone: `test_matching.py`,
+  `test_perception_model.py`, `test_perception_eval.py`, and
+  `test_train_perception_smoke.py`/`test_perception_eval_gpu.py`'s
+  gpu-marked tests raising the deselected count); **210 passed** (full, gpu
+  tests included -- 4 new gpu tests added this milestone: the real-data
+  training smoke, the eval CLI metrics/baseline path, and the render-check
+  path split across two tests per the renderer-sharing fix above).
+
+### Checkpoint: CI / new dependencies
+
+- **Purpose**: confirm this milestone didn't need any new dependency or CI
+  workflow change.
+- **Finding**: no new dependency was added -- `scipy.optimize
+  .linear_sum_assignment` (Hungarian matching) reuses the `ml` extra's
+  existing `scipy` dependency (already synced for V5's rotation-math
+  cross-checks). `.github/workflows/ci.yml`'s `test` job already runs
+  `uv sync --dev --extra render --extra sim --extra ml`, so no workflow
+  change was needed. Per this milestone's own rules, **no commit here is
+  pushed**, so this remains unverified against a live GitHub Actions run
+  until a future push, exactly as V4/V5 recorded honestly for their own
+  unpushed commits.
