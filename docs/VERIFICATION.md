@@ -53,11 +53,9 @@ so that any of these can be re-run by hand, not just by an agent.
 
 - **Purpose**: confirm the pinned Khronos glTF-Validator binary can be
   fetched and cached in CI, ahead of real validation logic landing in V1.
-- **Command**: `.github/workflows/ci.yml`, job `gltf-validator`
+- **Command**: `.github/workflows/ci.yml`, job `test` (tests/test_validator.py)
 - **Expected result**: downloads/caches `gltf-validator` release
-  `2.0.0-dev.3.10` (linux64) and `gltf_validator --version` prints a version
-  string; job is green. (No glTF files are validated yet — that starts in
-  V1.)
+  `2.0.0-dev.3.10` (linux64) and validates sample episodes; job is green.
 
 ## V1 — glTF transport codec: pose animation + KHR physics + RWM_state_series
 

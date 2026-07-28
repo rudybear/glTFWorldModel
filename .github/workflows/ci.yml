@@ -49,9 +49,11 @@ jobs:
         # importorskip.
         run: uv sync --dev --extra render --extra sim --extra ml
 
+      # Real glTF validation (tests/test_validator.py) runs inside the
+      # pytest suite below, using the pinned Khronos glTF-Validator binary.
       # tests/test_validator.py exercises gltfworld's own download/cache
       # logic (gltfworld.cli.ensure_validator_binary), which caches to
-      # ~/.cache/gltfworld/ independently of the gltf-validator job below.
+      # ~/.cache/gltfworld/ independently.
       - name: Cache gltfworld's glTF-Validator binary
         uses: actions/cache@v4
         with:
@@ -64,30 +66,3 @@ jobs:
         # context, which CI runners don't have; they're run locally only
         # (see docs/VERIFICATION.md V2 section).
         run: uv run pytest -v -m "not gpu"
-
-  gltf-validator:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Cache glTF-Validator binary
-        id: cache-validator
-        uses: actions/cache@v4
-        with:
-          path: gltf-validator
-          key: gltf-validator-${{ env.GLTF_VALIDATOR_VERSION }}-linux64
-
-      - name: Download pinned glTF-Validator release
-        if: steps.cache-validator.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p gltf-validator
-          curl -sSL \
-            "https://github.com/KhronosGroup/glTF-Validator/releases/download/${GLTF_VALIDATOR_VERSION}/gltf_validator-${GLTF_VALIDATOR_VERSION}-linux64.tar.xz" \
-            -o /tmp/gltf_validator.tar.xz
-          tar -xJf /tmp/gltf_validator.tar.xz -C gltf-validator
-
-      # This job only checks that the pinned binary runs. Real GLB/glTF
-      # validation against generated fixtures happens in the `test` job
-      # (tests/test_validator.py), via gltfworld's own
-      # download/cache path (gltfworld.cli.ensure_validator_binary),
-      # which is intentionally independent of this job's cache.
-      - name: Check glTF-Validator version
-        run: ./gltf-validator/gltf_validator --version
