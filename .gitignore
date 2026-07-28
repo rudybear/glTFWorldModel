@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+dist/
+*.egg-info/
+
+# project data / outputs (root-level only; does not affect src/gltfworld/data/)
+/data/
+/out/
+/runs/
+
+# generated glb assets, except checked-in golden fixtures
+*.glb
+!tests/goldens/**
+
+# hypothesis example database
+.hypothesis/

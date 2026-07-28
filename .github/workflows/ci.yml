@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  GLTF_VALIDATOR_VERSION: "2.0.0-dev.3.10"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run tests
+        run: uv run pytest -v
+
+  gltf-validator:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cache glTF-Validator binary
+        id: cache-validator
+        uses: actions/cache@v4
+        with:
+          path: gltf-validator
+          key: gltf-validator-${{ env.GLTF_VALIDATOR_VERSION }}-linux64
+
+      - name: Download pinned glTF-Validator release
+        if: steps.cache-validator.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p gltf-validator
+          curl -sSL \
+            "https://github.com/KhronosGroup/glTF-Validator/releases/download/${GLTF_VALIDATOR_VERSION}/gltf_validator-${GLTF_VALIDATOR_VERSION}-linux64.tar.xz" \
+            -o /tmp/gltf_validator.tar.xz
+          tar -xJf /tmp/gltf_validator.tar.xz -C gltf-validator
+
+      # V0 only checks that the pinned binary runs; it does not validate any
+      # glTF files yet. Real GLB/glTF validation against generated fixtures
+      # starts in milestone V1, once gltfworld actually produces glTF output.
+      - name: Check glTF-Validator version
+        run: ./gltf-validator/gltf_validator --version
