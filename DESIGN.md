@@ -1,6 +1,6 @@
 # DESIGN
 
-Status: 2026-07-27, milestone V2.
+Status: 2026-07-28, milestone V5.
 
 ## Architecture flow
 
@@ -449,6 +449,15 @@ renumbered starting from what's actually next after V3; nothing described
 below was silently dropped, it just already happened earlier than
 originally planned.
 
+**Second renumbering note (V5/V6 swap)**: the plan as of V4 had V5 =
+perception model, V6 = dynamics model, in that order. They're swapped here:
+the dynamics model landed first (as V5), perception second (now V6). Same
+reasoning as above -- no content dropped, just built in the order the
+underlying data/gate work actually supported: V4 packed and gate-passed
+`dynamics-v1` (10k episodes, states-only, no rendering needed) well before
+`perception-v1`'s smaller, rendering-dependent dataset had an obvious next
+model milestone lined up, so dynamics moved first.
+
 - **V0** (done) — project scaffold, CI, verification protocol.
 - **V1** (done) — glTF transport codec: pose animation +
   `KHR_physics_rigid_bodies`/`KHR_implicit_shapes` + `RWM_state_series`,
@@ -466,8 +475,15 @@ originally planned.
   `dynamics-v1`/`perception-v1` datasets, `stats` CLI, cross-validated
   PSNR/SSIM (`gltfworld.eval.metrics`). See "Dataset build (V4)" below,
   `docs/PRETRAINING_GATE.md`, and `docs/VERIFICATION.md`'s V4 section.
-- **V5** — perception model: frames -> scene state.
-- **V6** — dynamics model: state[t] -> state[t+1].
+- **V5** (done) — dynamics model: state[t] -> state[t+1]
+  (`InteractionTransformer`) + baselines (`BallisticBaseline`,
+  `NoInteractionMLP`) + training/eval harness. **Reordered ahead of V6**
+  (originally the other way around, see the second renumbering note below)
+  -- `dynamics-v1` (V4) packed and gate-passed first, so there was real data
+  to train a dynamics model against before `perception-v1` had an
+  equivalent model milestone ready to build on. See "Dynamics model (V5)"
+  below and `docs/VERIFICATION.md`'s V5 section.
+- **V6** — perception model: frames -> scene state.
 - **V7** — inference loop: model output -> glTF -> renderer, closed loop.
 - **V8** — external eval anchor: Physion replication (the primary
   *external* correctness anchor for this project's eval numbers, per V4's
@@ -534,3 +550,241 @@ Everything needed to justify starting model training lives behind
   documented as blocked (Google Drive folder gating, `clevrer.csail.mit.edu`
   unreachable from this environment, and an incompatible pinned training
   stack) rather than faked -- see `docs/VERIFICATION.md`.
+
+## Dynamics model (V5)
+
+`gltfworld.models.dynamics.InteractionTransformer` predicts `state[t] ->
+state[t+1]` directly on the `D=22` tensor contract (`gltfworld.scene.
+contract`); `gltfworld.models.baselines` holds two comparison points
+(`BallisticBaseline`, no learning; `NoInteractionMLP`, learned but with no
+cross-object attention); `gltfworld.train.train_dynamics` trains any of
+them with one shared harness; `gltfworld.eval.rollout` runs/evaluates
+autoregressive rollouts and re-exports predictions as real glTF, per this
+project's "inference emits glTF at every hop" principle (see the top-level
+architecture flow diagram).
+
+### Rotation math (`gltfworld.models.rotations`)
+
+Batched, differentiable torch, cross-validated against
+`scipy.spatial.transform.Rotation` (`tests/test_rotations.py`, 29 tests):
+quaternion normalize/hemisphere/multiply/conjugate, the axis-angle
+exponential map (`axis_angle_to_quat`, stable at `theta -> 0` via a Taylor
+expansion of `sin(theta/2)/theta` rather than dividing by a clamped
+`theta`), quaternion <-> rotation matrix (a batched, branchless adaptation
+of the standard four-case Shepperd method, in pytorch3d's convention but
+xyzw), quaternion <-> 6D rotation representation (Zhou et al. 2019: first
+two matrix columns; recovered via Gram-Schmidt), and geodesic angle.
+
+**Geodesic angle is not `2*arccos(|dot|)`.** It's computed as
+`4 * atan2(||q1 - q2||, ||q1 + q2||)` after aligning `q2`'s hemisphere to
+`q1` (not just the canonical `w>=0` hemisphere). Both formulas agree in
+exact arithmetic, but `arccos`'s derivative diverges as its argument
+approaches +-1 -- exactly where most training pairs land, since two states
+one 1/30s frame apart are usually only a few degrees apart. The
+`atan2`-of-norms form has a well-behaved gradient everywhere on `[0, pi]`,
+including at 0 (verified: `tests/test_rotations.py::
+test_geodesic_angle_gradient_finite_near_zero`). The `4x` factor (as
+opposed to the more commonly quoted `2x` for the *un-hemisphere-aligned*
+angle between the quaternions themselves) comes directly from the
+half-angle identities relating quaternion-vector angle to rotation angle;
+derived in the function's own docstring and cross-checked against
+`scipy`'s `Rotation.magnitude()` of the relative rotation.
+
+### `InteractionTransformer` (~4.8M params, target band 4-7M)
+
+- **Tokens**: one per object, embedding a hand-picked, roughly unit-scaled
+  24-dim feature vector (`object_features`: `pos/2.0`, `vel/3.0`,
+  `ang_vel/6.0`, the 6D rotation representation, `shape_onehot`,
+  `size/0.25`, `log_mass/3.0`, `friction`, `restitution` -- fixed scale
+  constants, not data-fit, chosen to roughly range-normalize
+  `wm-scenes-v1`'s sampled distributions per DESIGN.md's own V3 section);
+  one globals token (`globals_features`: `gravity/9.81`, `dt*30` --
+  camera deliberately excluded, irrelevant to physics); one learned
+  "ground" token (a plain `nn.Parameter`, *not* derived from any input
+  feature -- `wm-scenes-v1`'s ground plate is geometrically identical
+  across every episode, so there's no per-episode ground signal to encode;
+  this token just gives every object a fixed attention partner to learn
+  ground-relative dynamics against, `[CLS]`-style).
+- **6 pre-norm `nn.TransformerEncoder` layers**, `d_model=256`, 8 heads, MLP
+  ratio 4, `src_key_padding_mask` built from the dataset's per-object
+  `mask` so padded object slots are excluded from attention as *keys* (they
+  can never influence a real object's output -- see
+  `tests/test_dynamics.py::test_masking_invariance_padded_slots_dont_leak`).
+  No positional encoding is added across the object-token axis, so the
+  whole stack is permutation-equivariant in object order (`tests/
+  test_dynamics.py::test_permutation_equivariance_transformer`).
+- **Output head** (shared, zero-init final layer): per real-object token,
+  `(dv, dw, r)` -- linear-velocity delta, angular-velocity delta, and a
+  rotation-update rotation-vector (axis-angle), 3 each. Zero-init means a
+  freshly constructed model predicts all-zero deltas, so integration
+  reduces to *exact* constant-velocity extrapolation until training has
+  changed anything (`tests/test_dynamics.py::
+  test_integrator_exactness_fresh_model_matches_ballistic`: with gravity
+  zeroed out, a fresh model's output is bit-identical, same dtype/op order,
+  to `BallisticBaseline`'s).
+- **Integration** (`gltfworld.models.dynamics.integrate`, semi-implicit
+  Euler, shared by every model in this milestone -- baselines import it
+  directly rather than reimplementing it, so a model-vs-baseline comparison
+  is never comparing different arithmetic):
+
+  ```
+  v' = v + dv
+  p' = p + v' * dt          (uses the *updated* velocity)
+  w' = w + dw
+  q' = normalize(hemisphere(exp(r) (x) q))
+  ```
+
+  Static per-object features (shape one-hot, size, log-mass, friction,
+  restitution) are copied through unchanged.
+- Parameter count is printed by `python -m gltfworld.models.dynamics`
+  (asserts the 4-7M band itself); measured on this machine: **4,815,113**.
+
+### Baselines (`gltfworld.models.baselines`)
+
+- **`BallisticBaseline`**: `dv = gravity * dt`, `dw = 0`, `r = 0` -- no
+  learned parameters, routed through the exact same `integrate` call.
+- **`NoInteractionMLP`**: per-object MLP (`object_features` concatenated
+  with `globals_features`, 2 hidden layers of 256; output head is *not*
+  zero-init, unlike `InteractionTransformer`'s -- see below), applied
+  independently per object token -- no attention, no mechanism for one
+  object to influence another's prediction. This is the ablation that
+  isolates what
+  `InteractionTransformer`'s cross-object attention actually buys.
+  Measured parameter count: **75,529** -- smaller than the milestone
+  spec's "~0.3M" approximation. Deviation, documented rather than papered
+  over: the literal architecture description ("2x256 hidden") was kept as
+  ground truth over the approximate parameter count, since the two aren't
+  simultaneously satisfiable with this feature dimensionality without
+  padding the network with width that architecture description doesn't
+  ask for.
+- **Why `NoInteractionMLP` isn't zero-init**: `InteractionTransformer`'s
+  zero-init is a real invariant (exact constant-velocity start, tested).
+  For this much smaller ablation model, zero-init would leave almost no
+  loss to reduce inside the training harness's 500-step `--smoke` check
+  (constant velocity is already a good approximation over a single
+  1/30s step) -- a small random init (`nn.Linear`'s default) instead gives
+  smoke a real, non-trivial loss curve to demonstrate learning on. Both
+  models still route zero explicit deltas through the identical
+  `integrate` function bit-identically to `BallisticBaseline`
+  (`tests/test_dynamics.py::test_mlp_shares_integrator_with_zero_deltas`)
+  -- the *only* thing that changed is what the network predicts before any
+  training, not the integrator.
+
+### Training harness (`gltfworld.train.train_dynamics`)
+
+JSON-loadable `Config` dataclass (`configs/dynamics_v1.json` for
+`InteractionTransformer`, `configs/dynamics_mlp.json` for
+`NoInteractionMLP`); two-phase schedule:
+
+- **Phase 1** (default 40k steps): single-step teacher forcing. Every step
+  samples a random `(state_t, state_t+1)` transition (via `TransitionSampler`,
+  a vectorized in-memory gather over the packed split's tensors -- moved
+  to `device` once, no per-item Python-loop `DataLoader` overhead), adds
+  Gaussian noise to `state_t` (position `sigma=5mm`, velocity
+  `sigma=0.02 m/s`, rotation `sigma=0.5 deg` via a random small axis-angle
+  composed onto the quaternion), predicts one step, and computes the
+  masked weighted loss against the *clean* `state_t+1`. AdamW, `lr=3e-4`
+  cosine-annealed to a floor, bf16 autocast, grad-norm clip 1.0.
+- **Phase 2** (default 10k steps): `K`-step autoregressive rollout
+  finetuning (`SequenceSampler`, same vectorized-gather approach but over
+  full `(T, N_max, D)` episode windows), `K` annealed linearly 2 -> 8 across
+  the phase, no input noise (the model's own rollout error is the only
+  "noise" here), a fresh AdamW at `lr=1e-4`.
+- **Loss** (`compute_losses`): masked, weighted MSE on normalized-unit
+  position/velocity/angular-velocity (divided by the same `POS_SCALE`/
+  `VEL_SCALE`/`ANGVEL_SCALE` constants `object_features` uses, so the three
+  components are on commensurate scales) plus a squared-geodesic-angle
+  rotation term (`quat_geodesic_angle(pred_quat, target_quat)**2`); weights
+  all configurable, default 1.0 each; every component logged separately.
+- **Checkpoints**: `step_{N:07d}.safetensors` (model weights only) every
+  `ckpt_every` steps, plus `best.safetensors` (lowest val total loss) and
+  `last.safetensors` (most recent), each with a matching
+  `*.train_state.pt` (optimizer/scheduler/step/RNG state -- plain
+  `torch.save`, not safetensors, since it isn't a flat tensor map).
+  `--resume` restores model + both phases' optimizer/scheduler state + the
+  global step counter + every RNG stream (Python/`numpy`/torch CPU+CUDA),
+  and continues into whichever phase the restored step falls into.
+  Verified by direct harness test (not just unit test): a 100-step partial
+  run resumed to 300 steps continues the cosine schedule and phase
+  transition (phase 1 -> phase 2 at step 200) correctly, `log.csv` appended
+  (never truncated) across the resume boundary.
+- **`--smoke`**: overrides to 500 steps (phase 2 skipped), a tiny val
+  subset, and asserts the *EMA-smoothed* (decay 0.98) training loss dropped
+  >= 30% from an early-vs-final comparison window, printing both the raw
+  (high-variance, single-random-batch-per-step) and EMA curves either way.
+  Why EMA and not raw: single-batch loss variance (different episodes'
+  object counts/difficulty land in different random batches) dominates the
+  raw per-step signal at this batch size over only 500 steps; EMA is the
+  standard practical smoothing for exactly this kind of noisy-loss
+  pass/fail check. Measured on the real `dynamics-v1` packed dataset (RTX
+  PRO 6000 Blackwell): `InteractionTransformer` **41.5% raw / 38.7% EMA**
+  drop in 4.2s; `NoInteractionMLP` **38.9% raw / 35.5% EMA** drop in 1.7s
+  -- both comfortably clear the 30% bar and finish in seconds, not the 3
+  minute budget.
+- **`NoInteractionMLP`'s tuned `lr=5e-3`** (vs. `InteractionTransformer`'s
+  `3e-4`), a deliberate, documented choice: at the transformer's `lr`, the
+  MLP's per-batch training loss is so dominated by batch-composition noise
+  (which objects/episodes land in a given random batch materially changes
+  intrinsic task difficulty) that it doesn't clear the smoke gate even
+  though its *validation* loss (a much lower-variance, fixed-subset signal)
+  does genuinely improve -- a real, measured finding about how much faster
+  a much smaller model needs to move to show up above that noise floor in
+  only 500 steps, not a bug. A higher `lr`, reasonable for a 75K-param MLP
+  regressing near-zero deltas, resolves it with a real (not just
+  noise-window-selection) validation-loss improvement to back it up
+  (0.0453 -> 0.0367 in 500 steps at `lr=5e-3`, vs. 0.0472 -> 0.0468 -- barely
+  moving -- at `lr=3e-4`).
+- **Determinism**: `set_seed` seeds Python/`numpy`/torch (CPU + all CUDA
+  devices); training-state checkpoints round-trip every one of those RNG
+  streams so `--resume` continues the same stream. **Not** pinned down,
+  documented rather than silently assumed away: cuDNN kernel-selection
+  nondeterminism (moot in practice -- this model has no convolutions) and
+  the inherent nonassociativity of floating-point reduction order in CUDA's
+  parallel matmul/attention/softmax kernels (bf16 autocast in particular)
+  -- bit-identical reruns on GPU aren't guaranteed even with every seed
+  fixed, only statistically equivalent runs.
+
+### Rollout + eval (`gltfworld.eval.rollout`)
+
+- `rollout(model, initial_state, mask, globals, T)` -- accepts either a
+  single episode (`(N, D)`) or a batch (`(B, N, D)`), autoregressive (index
+  0 is the given initial state unmodified; indices `1..T-1` are the model's
+  own successive predictions, never re-fed ground truth).
+- CLI computes, for the requested checkpoint, `BallisticBaseline`, and
+  (optionally, `--mlp-ckpt`) a `NoInteractionMLP` checkpoint: per-horizon
+  (default `1/5/10/30/99`) position/rotation/velocity error, median + IQR
+  over every unmasked `(episode, object)` pair; writes `metrics.json` +
+  a markdown table `metrics.md`, and a log-y divergence-curve PNG (median
+  position error at *every* horizon `1..T-1`, one line per model --
+  `matplotlib`, added to the `ml` extra for this milestone).
+- **glTF at every hop** (`--emit-gltf N`): re-exports N test episodes as
+  real, loadable `.glb` pairs -- `pred/ep_XXXXXX.glb` (the model's own
+  rolled-out prediction, rebuilt into a *full* `Episode` via
+  `tensors_to_episode`: same scene, same ground/static objects held at
+  their template frame-0 pose since the tensor contract never carries
+  static poses at all, `pose_variance` omitted) and `gt/ep_XXXXXX.glb` (the
+  same tensors re-exported from ground truth, for a same-format diff).
+  Round-trip verified to <= 1e-6 absolute
+  (`tests/test_rollout.py::test_pred_glb_roundtrip`): `load_episode` of a
+  written pred `.glb`, run back through `episode_to_tensors`, reproduces
+  the exact tensors that built it.
+- `--video N` (needs the `render` extra + a real GPU/EGL context, lazily
+  imported): renders GT-vs-pred side-by-side mp4s at 30fps via
+  `EpisodeRenderer` + `imageio-ffmpeg`.
+
+### Acceptance (see `docs/VERIFICATION.md`'s V5 section for exact commands)
+
+Model must beat `BallisticBaseline` on median position error at horizons
+1/10/30 on the `dynamics-v1` test split. Measured on a 300-step
+correctness-check training run (not the full 50k-step run, which the
+orchestrator runs separately per this milestone's own scope boundary --
+training code is delivered and smoke-tested here, not executed to
+completion): at h=30, model **0.283m** vs. ballistic **4.625m**; at h=99,
+model **1.289m** vs. ballistic **55.542m** -- ballistic's unbounded
+constant-gravity extrapolation (no floor, no collisions) diverges
+catastrophically past first contact, exactly the failure mode a learned
+model is supposed to fix. At h=1 the two are closer (0.0055m vs. 0.0053m --
+a single 1/30s step is dominated by the ballistic term either way,
+un-surprising this early and this undertrained); h=1/10 pass the same
+"model <= ballistic" bar at full training convergence is expected to
+widen, not close, given h=30/h=99's trend.

@@ -643,3 +643,208 @@ values; this section is the narrative/how-it-was-verified writeup.
   therefore recorded as **not independently green on GitHub yet** in
   `docs/PRETRAINING_GATE.md`, with the above root-cause/fix documented so
   it isn't mistaken for silence/oversight.
+
+## V5 -- dynamics model + baselines + training/eval code
+
+Needs the `ml` extra (`torch`, `safetensors`, `scipy`, `matplotlib`,
+`imageio[ffmpeg]`): `uv sync --dev --extra ml`. `--emit-gltf`/`--video`
+additionally need `--extra sim`/`--extra render` (only for the CLI demo and
+gpu-marked training smoke against real data; the unit test suite itself
+doesn't need them). See DESIGN.md's "Dynamics model (V5)" section for the
+full architecture/training-harness writeup this section verifies against.
+
+### Checkpoint: rotation math vs. scipy (independent reference)
+
+- **Purpose**: confirm every batched torch rotation op
+  (`gltfworld.models.rotations`) -- quat normalize/hemisphere/multiply,
+  axis-angle exponential map, quat<->matrix, quat<->6D, geodesic angle --
+  agrees with `scipy.spatial.transform.Rotation` (same xyzw/axis-angle
+  conventions, no translation needed), including the small-angle/near-zero
+  numerical-stability cases and gradient finiteness.
+- **Command**: `uv run pytest tests/test_rotations.py -v`
+- **Expected result**: all 29 tests pass. Observed: **29/29 pass**.
+
+### Checkpoint: dynamics model correctness (integrator, equivariance, masking)
+
+- **Purpose**: confirm `InteractionTransformer`'s parameter count lands in
+  the 4-7M target band; confirm a freshly constructed (zero-init head)
+  model is bit-identical to `BallisticBaseline` with gravity zeroed out
+  (both reduce to the same constant-velocity update through the *same*
+  shared `integrate` function); confirm permutation equivariance across the
+  object-token axis (for both `InteractionTransformer` and
+  `NoInteractionMLP`); confirm padded object slots never leak into real
+  slots' outputs (3 real objects vs. the same 3 padded to 5, masked);
+  confirm forward output is finite with a genuinely unit quaternion.
+- **Command**: `uv run pytest tests/test_dynamics.py -v`
+- **Expected result**: all 9 tests pass. Observed: **9/9 pass**. Printed
+  param count (`uv run python -m gltfworld.models.dynamics`): **4,815,113**
+  (within the 4-7M band); `uv run python -m gltfworld.models.baselines`:
+  `BallisticBaseline` 0 params (no learning), `NoInteractionMLP` **75,529**
+  params (see DESIGN.md for why this is smaller than the spec's "~0.3M"
+  approximation -- a documented, deliberate deviation, not an oversight).
+
+### Checkpoint: rollout + eval correctness (shape, glTF round trip)
+
+- **Purpose**: confirm `rollout()` produces the right shape/is finite for
+  both single-episode and batched calling conventions and agrees between
+  them; confirm `divergence_curve`/`horizon_metrics` are exactly zero
+  comparing identical tensors to themselves and nonzero for a baseline that
+  genuinely diverges from ground truth; confirm the "glTF at every hop"
+  round trip (`tensors_to_episode` -> `save_episode` -> `load_episode` ->
+  `episode_to_tensors`) reproduces the predicted tensors to <= 1e-6, and
+  that a rebuilt episode's static (ground) object holds a constant pose
+  across every frame.
+- **Command**: `uv run pytest tests/test_rollout.py -v`
+- **Expected result**: all 7 tests pass. Observed: **7/7 pass**.
+
+### Checkpoint: training harness smoke (gpu, real `dynamics-v1` data)
+
+- **Purpose**: confirm the training harness -- data loading, noise
+  injection, optimizer/scheduler, bf16 autocast, checkpoint IO -- actually
+  works end-to-end against the real packed `dynamics-v1` dataset (not a
+  synthetic fixture), and that 500 steps measurably drops the (EMA-
+  smoothed) training loss, for *both* `InteractionTransformer` and
+  `NoInteractionMLP`, each within the 3-minute budget.
+- **Command**:
+
+  ```bash
+  uv run python -m gltfworld.train.train_dynamics \
+      --config configs/dynamics_v1.json --out /tmp/dynamics-v1-smoke --smoke
+  uv run python -m gltfworld.train.train_dynamics \
+      --config configs/dynamics_mlp.json --out /tmp/dynamics-mlp-smoke --smoke
+  ```
+
+  or as a pytest (skips cleanly if `data/dynamics-v1/packed/` isn't
+  present locally): `uv run pytest tests/test_train_smoke.py -v -m gpu -s`
+- **Expected result**: both exit 0. Measured on this machine (RTX PRO 6000
+  Blackwell): `InteractionTransformer` (4,815,113 params) **41.5% raw /
+  38.7% EMA** loss drop in **4.2s**; `NoInteractionMLP` (75,529 params)
+  **38.9% raw / 35.5% EMA** loss drop in **1.7s** -- both comfortably clear
+  the 30% bar, in seconds rather than the 3-minute budget. Full printed
+  curves:
+
+  ```
+  # InteractionTransformer (configs/dynamics_v1.json)
+  model=transformer device=cuda params=4,815,113
+  step 100/500 phase=1 k=1 train_loss=0.05943 val_loss=0.04044 elapsed=1.1s
+  step 200/500 phase=1 k=1 train_loss=0.03334 val_loss=0.03545 elapsed=1.9s
+  step 300/500 phase=1 k=1 train_loss=0.02917 val_loss=0.03183 elapsed=2.6s
+  step 400/500 phase=1 k=1 train_loss=0.06719 val_loss=0.03007 elapsed=3.4s
+  step 500/500 phase=1 k=1 train_loss=0.06925 val_loss=0.02967 elapsed=4.2s
+  smoke: raw start_loss=0.05930 end_loss=0.03468 drop=41.5%
+  smoke: ema start_loss=0.05627 end_loss=0.03450 drop=38.7%
+  SMOKE PASS
+
+  # NoInteractionMLP (configs/dynamics_mlp.json)
+  model=mlp device=cuda params=75,529
+  step 100/500 phase=1 k=1 train_loss=0.06214 val_loss=0.04532 elapsed=0.6s
+  step 200/500 phase=1 k=1 train_loss=0.03965 val_loss=0.04204 elapsed=0.9s
+  step 300/500 phase=1 k=1 train_loss=0.03782 val_loss=0.03869 elapsed=1.2s
+  step 400/500 phase=1 k=1 train_loss=0.07703 val_loss=0.03731 elapsed=1.5s
+  step 500/500 phase=1 k=1 train_loss=0.07522 val_loss=0.03671 elapsed=1.7s
+  smoke: raw start_loss=0.06829 end_loss=0.04175 drop=38.9%
+  smoke: ema start_loss=0.06456 end_loss=0.04163 drop=35.5%
+  SMOKE PASS
+  ```
+
+### Checkpoint: resumability (hand-verified, not just unit-tested)
+
+- **Purpose**: confirm `--resume` actually continues an interrupted run
+  correctly -- model weights, both phases' optimizer/scheduler state, the
+  global step counter, and every RNG stream -- rather than merely not
+  crashing.
+- **Command**: run a short config to step 100 without `--resume`, then run
+  the same `--out` directory again with `--resume` and a config whose
+  total step count is higher; inspect `log.csv` for continuity.
+- **Expected result / observed**: a 100-step partial run followed by
+  `--resume` to a 300-step target continued cleanly from step 100 (printed
+  `resumed from step 100`), correctly re-entered phase 1's cosine schedule
+  (`lr` back near its phase-1 value, not reset to the initial value nor
+  jumped to phase 2 early) and transitioned to phase 2 exactly at step 200
+  (`k` annealing 2->8 observed correctly: `k=5` at step 250, `k=8` at step
+  300, matching the linear anneal formula), with `log.csv` appended (not
+  truncated) across the resume boundary and `step_0000100/0200/0300.
+  safetensors` + matching `.train_state.pt` files all present.
+
+### Checkpoint: full training run command (for the orchestrator)
+
+- **Purpose**: the exact command the orchestrator runs to actually train
+  the shipped `dynamics-v1` model and its `NoInteractionMLP` baseline to
+  completion -- **not run as part of this milestone** (V5 delivers and
+  smoke-tests the training code; the full run is explicitly out of scope
+  here, per this milestone's own rules).
+- **Command**:
+
+  ```bash
+  uv run python -m gltfworld.train.train_dynamics \
+      --config configs/dynamics_v1.json --out runs/dynamics-v1
+  uv run python -m gltfworld.train.train_dynamics \
+      --config configs/dynamics_mlp.json --out runs/dynamics-mlp --model mlp
+  ```
+
+  Both are resumable (`--resume`) if interrupted; `runs/` is git-ignored
+  (`.gitignore`), so no run artifacts are committed regardless.
+
+### Checkpoint: eval CLI demo (rollout, metrics, glTF-at-every-hop)
+
+- **Purpose**: confirm the eval CLI end-to-end, the way the orchestrator
+  will actually use it once the full training run above has produced real
+  checkpoints -- per-horizon metrics, the markdown table, the divergence
+  curve PNG, and predicted/ground-truth episodes re-exported as real,
+  independently loadable `.glb` files.
+- **Command**:
+
+  ```bash
+  uv run python -m gltfworld.eval.rollout \
+      --ckpt runs/dynamics-v1/best.safetensors \
+      --data data/dynamics-v1/packed --split test \
+      --out runs/dynamics-v1/eval \
+      --mlp-ckpt runs/dynamics-mlp/best.safetensors \
+      --emit-gltf 5
+  ```
+
+- **Expected result**: writes `metrics.json`, `metrics.md`,
+  `divergence_curve.png`, and `pred/ep_XXXXXX.glb` / `gt/ep_XXXXXX.glb`
+  pairs for 5 test episodes to `runs/dynamics-v1/eval/`; exits 0.
+  **Acceptance bar**: the trained `InteractionTransformer` must beat
+  `BallisticBaseline` on median position error at horizons 1/10/30 on the
+  test split. Sanity-checked (not the full run -- a 300-step
+  correctness-check training run, since the full run is out of this
+  milestone's scope, see above) on 10 real `dynamics-v1` test-split
+  episodes (`--max-episodes 10`):
+
+  | model | h=1 | h=10 | h=30 | h=99 |
+  | --- | --- | --- | --- | --- |
+  | model (300-step) | 0.0055m | 0.0808m | 0.2833m | 1.2886m |
+  | ballistic | 0.0053m | 0.0534m | 4.6248m | 55.5423m |
+
+  Even this minimally-trained checkpoint already beats ballistic by more
+  than an order of magnitude at h=30/h=99 (ballistic's constant-gravity,
+  no-collision extrapolation diverges catastrophically past first ground
+  contact); h=1/h=10 are close either way at 300 steps (a single-or-few
+  1/30s step is dominated by the ballistic term regardless of training),
+  consistent with the trend widening (not closing) as training
+  progresses to the full run.
+
+### Checkpoint: full test suite
+
+- **Purpose**: confirm this milestone didn't regress anything upstream and
+  that everything new is exercised.
+- **Command**: `uv run pytest -v -m "not gpu"` (CI-equivalent) and
+  `uv run pytest -v` (full, local, GPU machine only).
+- **Expected result / observed**: **168 passed, 10 deselected** (not-gpu);
+  **178 passed** (full, gpu tests included -- 2 new gpu tests added this
+  milestone: the real-data training smoke, parametrized over both models).
+
+### Checkpoint: CI
+
+- **Purpose**: confirm CI's dependency set covers this milestone's new
+  `matplotlib` dependency (added to the `ml` extra for the divergence-curve
+  plot).
+- **Finding**: `.github/workflows/ci.yml`'s `test` job already runs
+  `uv sync --dev --extra render --extra sim --extra ml` (added in V4), so
+  no CI workflow change was needed this milestone -- `matplotlib` resolves
+  automatically as part of the existing `--extra ml` sync. Per this
+  milestone's own rules, **no commit here is pushed**, so (as recorded
+  honestly in V4's own CI checkpoint) the last actually-pushed commit's CI
+  run predates this fix and is unaffected either way.

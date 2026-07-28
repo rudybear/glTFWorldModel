@@ -10,7 +10,7 @@ dependencies = ["numpy>=1.26", "pygltflib>=1.16.5", "trimesh>=4.0"]
 
 [project.optional-dependencies]
 sim = ["mujoco>=3.1"]
-ml = ["torch>=2.3", "safetensors>=0.4", "scipy>=1.11", "imageio[ffmpeg]>=2.34"]
+ml = ["torch>=2.3", "safetensors>=0.4", "scipy>=1.11", "imageio[ffmpeg]>=2.34", "matplotlib>=3.8"]
 # Runtime deps of the vendored pyrender (src/gltfworld/_vendor/pyrender, see
 # PROVENANCE.md): exactly what the vendored code imports on the paths
 # gltfworld exercises. Deliberately excludes pyglet (guarded out; only the
