@@ -1,0 +1,67 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "RWM_state_series.schema.json",
+    "title": "RWM_state_series glTF Document Extension",
+    "type": "object",
+    "description": "Custom gltfworld vendor extension carrying per-frame world state (linear/angular velocity, actions, pose variance) that rides alongside a standard glTF STEP pose animation, sharing its time accessor.",
+    "properties": {
+        "version": {
+            "const": "0.1",
+            "description": "RWM_state_series schema version."
+        },
+        "timesAccessor": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Index of the shared time accessor (float32 seconds, SCALAR), the same accessor used as the animation sampler input."
+        },
+        "channels": {
+            "type": "array",
+            "description": "Per-object or per-episode time-series channels.",
+            "items": { "$ref": "#/$defs/channel" }
+        }
+    },
+    "required": ["version", "timesAccessor", "channels"],
+    "additionalProperties": false,
+    "$defs": {
+        "channel": {
+            "type": "object",
+            "description": "One time-series channel: a (count == len(times)) accessor of up to 4 feature dims, tied to a node or the whole episode.",
+            "properties": {
+                "target": {
+                    "description": "The node this channel applies to, or \"world\" for episode-wide channels (e.g. actions).",
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "node": { "type": "integer", "minimum": 0 }
+                            },
+                            "required": ["node"],
+                            "additionalProperties": false
+                        },
+                        { "const": "world" }
+                    ]
+                },
+                "kind": {
+                    "enum": [
+                        "linear_velocity",
+                        "angular_velocity",
+                        "action",
+                        "pose_variance"
+                    ]
+                },
+                "accessor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Index of the accessor holding this channel's data (SCALAR/VEC2/VEC3/VEC4, float32, count == len(times))."
+                },
+                "component": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "0-based chunk index, present only when a value's natural feature width exceeds 4 and had to be split across multiple accessors/channels of the same kind (e.g. 7-wide pose_variance, or actions with more than 4 dims). Decode concatenates chunks in ascending component order."
+                }
+            },
+            "required": ["target", "kind", "accessor"],
+            "additionalProperties": false
+        }
+    }
+}

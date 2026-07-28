@@ -18,7 +18,7 @@ custom extensions are needed to fill in.
 
 | Piece | Role |
 |---|---|
-| [pygltflib](https://github.com/KhronosGroup/glTF/) | glTF/GLB read + write |
+| [pygltflib](https://gitlab.com/dodgyville/pygltflib) | glTF/GLB read + write |
 | [trimesh](https://trimesh.org/) | mesh generation only |
 | [MuJoCo](https://mujoco.org/) | physics simulation, episode generation |
 | vendored [pyrender](https://github.com/mmatl/pyrender) (V2) | headless rendering of glTF scenes |
@@ -27,7 +27,8 @@ custom extensions are needed to fill in.
 
 ## Status
 
-V0 scaffold — see [docs/VERIFICATION.md](docs/VERIFICATION.md).
+V1 — glTF transport codec (pose animation + KHR physics + `RWM_state_series`)
+— see [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Setup
 

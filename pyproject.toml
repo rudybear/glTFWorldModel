@@ -13,7 +13,7 @@ sim = ["mujoco>=3.1"]
 ml = ["torch>=2.3", "safetensors>=0.4", "scipy>=1.11", "imageio[ffmpeg]>=2.34"]
 
 [dependency-groups]
-dev = ["pytest>=8", "hypothesis>=6"]
+dev = ["pytest>=8", "hypothesis>=6", "jsonschema>=4"]
 
 [project.scripts]
 gltfworld = "gltfworld.cli:main"

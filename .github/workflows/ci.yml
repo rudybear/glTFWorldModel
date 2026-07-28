@@ -19,6 +19,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
+      # tests/test_validator.py exercises gltfworld's own download/cache
+      # logic (gltfworld.cli.ensure_validator_binary), which caches to
+      # ~/.cache/gltfworld/ independently of the gltf-validator job below.
+      - name: Cache gltfworld's glTF-Validator binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gltfworld
+          key: gltfworld-gltf-validator-${{ env.GLTF_VALIDATOR_VERSION }}-linux64
+
       - name: Run tests
         run: uv run pytest -v
 
@@ -41,8 +50,10 @@ jobs:
             -o /tmp/gltf_validator.tar.xz
           tar -xJf /tmp/gltf_validator.tar.xz -C gltf-validator
 
-      # V0 only checks that the pinned binary runs; it does not validate any
-      # glTF files yet. Real GLB/glTF validation against generated fixtures
-      # starts in milestone V1, once gltfworld actually produces glTF output.
+      # This job only checks that the pinned binary runs. Real GLB/glTF
+      # validation against generated fixtures happens in the `test` job
+      # (tests/test_validator.py), via gltfworld's own
+      # download/cache path (gltfworld.cli.ensure_validator_binary),
+      # which is intentionally independent of this job's cache.
       - name: Check glTF-Validator version
         run: ./gltf-validator/gltf_validator --version
