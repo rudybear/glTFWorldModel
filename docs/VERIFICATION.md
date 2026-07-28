@@ -826,6 +826,15 @@ full architecture/training-harness writeup this section verifies against.
   consistent with the trend widening (not closing) as training
   progresses to the full run.
 
+### Observed (full run)
+
+The full training runs (`configs/dynamics_v1.json` and `configs/dynamics_mlp.json`)
+have been completed and independently verified. Detailed results recorded in
+[docs/RESULTS.md](docs/RESULTS.md): **acceptance bar met** (InteractionTransformer
+beats ballistic at all horizons: 1.4× at h=10, 42× at h=30, 176× at h=99). The
+MLP competitiveness finding (slightly better at h=30/99 medians, overlapping IQRs)
+is documented honestly in RESULTS.md per project policy.
+
 ### Checkpoint: full test suite
 
 - **Purpose**: confirm this milestone didn't regress anything upstream and

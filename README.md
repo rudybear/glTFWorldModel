@@ -37,6 +37,11 @@ pyrender; MuJoCo cross-render oracle), and V1 (glTF transport codec: pose
 animation + KHR physics + `RWM_state_series`) — see
 [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
+## Results
+
+V5 dynamics training + independent verification complete — recorded in
+[docs/RESULTS.md](docs/RESULTS.md).
+
 ## Setup
 
 ```bash
