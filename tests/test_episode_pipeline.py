@@ -104,12 +104,16 @@ def test_objects_never_sink_below_ground(generated_dataset, episode_index):
        ground impact): a much looser 10cm sanity bound. A fresh, fast,
        realistically-massed impact against MuJoCo's finite-stiffness
        soft-contact model produces real, physically-inherent transient
-       penetration well past 5mm for a step or two (measured up to ~21mm
-       here even after tightening solref/solimp beyond MuJoCo's defaults --
-       see ``gltfworld.datagen.mujoco_env``) before the contact resolves;
-       treating that as "sinking" would conflate a normal impact transient
-       with an object actually falling through the floor, which is what
-       this looser bound is really guarding against.
+       penetration well past 5mm for a step or two (a single-run example
+       measured ~21mm even after tightening solref/solimp beyond MuJoCo's
+       defaults -- see ``gltfworld.datagen.mujoco_env``; a broader,
+       independent multi-seed sweep found worse cases still, up to ~84mm
+       for small/fast/dense objects taking a hard secondary bounce -- see
+       DESIGN.md "Ground-contact tolerances" for the full measurement)
+       before the contact resolves; treating that as "sinking" would
+       conflate a normal impact transient with an object actually falling
+       through the floor, which is what this looser (still comfortably
+       un-tripped) bound is really guarding against.
     """
     path = generated_dataset.episode_paths[episode_index]
     episode = load_episode(path)

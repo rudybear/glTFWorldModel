@@ -11,7 +11,18 @@ them with. ``size`` follows the same per-shape convention as
 
 - sphere: ``[r, r, r]``
 - box: half-extents ``[hx, hy, hz]``
-- cylinder: ``[r, half_height, r]``
+- cylinder: ``[r, half_height, r]``, symmetric about the local **Y** axis
+  (radius in the X/Z plane, half-height along Y) -- matching both
+  ``ObjectSpec``'s documented convention and the vendored
+  ``KHR_implicit_shapes`` cylinder schema's own text ("centered along the Y
+  axis"). ``trimesh.creation.cylinder`` generates a mesh symmetric about
+  local **Z** by default; :func:`mesh_for` rotates that output -90 degrees
+  about local X (a proper rotation, applied to vertices *and* normals)
+  before returning it, so the mesh this module hands back is genuinely
+  Y-symmetric, not just documented as such (see the V3.1 report / DESIGN.md
+  "Cylinder axis convention" for the interop bug this fixes: a
+  spec-conformant external ``KHR_implicit_shapes`` reader reconstructs the
+  collider centered on Y, so the visual mesh must actually agree).
 """
 
 from __future__ import annotations
@@ -75,6 +86,14 @@ def mesh_for(shape: str, size) -> Mesh:
         radius = float(size[0])
         height = float(size[1] * 2.0)
         mesh = trimesh.creation.cylinder(radius=radius, height=height, sections=_CYLINDER_SECTIONS)
+        # trimesh's cylinder is symmetric about local Z by default; rotate
+        # -90 degrees about local X so it's symmetric about local Y instead,
+        # matching ObjectSpec's documented convention and the
+        # KHR_implicit_shapes cylinder schema ("centered along the Y axis").
+        # A proper rotation (orthonormal, det +1) transforms vertices and
+        # (via trimesh's own apply_transform) face/vertex normals correctly
+        # together -- see module docstring and tests/test_cylinder_axis.py.
+        mesh.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2.0, [1.0, 0.0, 0.0]))
     elif shape == "plane":
         # No native "plane" primitive is used on the wire (ObjectSpec only
         # allows sphere/box/cylinder); a thin box stands in for a finite

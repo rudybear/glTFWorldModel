@@ -343,23 +343,49 @@ loudly instead of silently reporting a perfect score.
   with `timeconst` fixed at MuJoCo's recommended minimum (2x the physics
   timestep). `wm-scenes-v1` fixes restitution at a low 0.1, where this
   barely matters in practice.
-- **Cylinder axis mismatch (found, not fixed, in V3).**
-  `gltfworld.scene.primitives.mesh_for("cylinder", ...)` (trimesh's
-  default) generates a mesh symmetric about the *local Z* axis, but
-  `ObjectSpec`'s documented convention (and the vendored
-  `KHR_implicit_shapes` cylinder schema's own text: "centered along the Y
-  axis") says local *Y*. This is a pre-existing V1 mesh-generation bug, out
-  of scope for V3 to fix -- but it matters here because MuJoCo's native
-  `type="cylinder"` geom is *also* Z-symmetric. `scene_to_mjcf`
-  deliberately mirrors gltfworld's *actual* (Z-symmetric, buggy-relative-
-  to-its-own-docs) convention rather than the documented one, so physics
-  geometry, the renderer's visual mesh, and any cross-check of the two stay
-  mutually consistent for the same object (fixing only the physics side
-  would make simulated cylinders visually lie sideways relative to how
-  their own collider says they're oriented). Recommended follow-up: rotate
-  `mesh_for`'s cylinder -90 degrees about local X so it actually matches
-  its own documented/schema convention, in a milestone that isn't mid-
-  stream on MuJoCo integration.
+- **Cylinder axis convention (fixed in V3.1; found, not fixed, in V3).**
+  V3 shipped with a real interop bug: `gltfworld.scene.primitives.mesh_for
+  ("cylinder", ...)` (trimesh's default) generated a mesh symmetric about
+  the *local Z* axis, but `ObjectSpec`'s documented convention (and the
+  vendored `KHR_implicit_shapes` cylinder schema's own text: "centered
+  along the Y axis") says local *Y*. V3's `scene_to_mjcf` papered over this
+  by deliberately mirroring gltfworld's *actual* (Z-symmetric,
+  buggy-relative-to-its-own-docs) mesh convention in the physics geometry
+  too, so gltfworld's own renderer and MuJoCo agreed with *each other* --
+  but a spec-conformant external `KHR_implicit_shapes` reader, which has no
+  way to know about that mesh bug, reconstructs the collider centered on Y
+  and would show every cylinder rotated 90 degrees relative to gltfworld's
+  own renderer, for the exact same node quaternion. Independent
+  verification confirmed this and classified it an interop defect, not an
+  internal-consistency issue.
+
+  V3.1 fixes it the other way around: `mesh_for`'s cylinder is now rotated
+  -90 degrees about local X (a proper rotation, vertices and normals both)
+  so the mesh is genuinely Y-symmetric, matching `ObjectSpec`/the schema.
+  Since MuJoCo's native `type="cylinder"` geom type is *always*
+  Z-symmetric (a builtin primitive, not something MJCF can reparameterize),
+  `scene_to_mjcf` (and `gltfworld.render.crosscheck`'s separate MJCF
+  builder) now instead give every cylinder geom a fixed,
+  body-orientation-independent local `quat` (-90 degrees about local X,
+  see `_CYLINDER_LOCAL_FIX_QUAT_WXYZ`) that re-centers MuJoCo's native
+  Z-symmetric shape onto local Y *within the body frame*, before the
+  body's own (unchanged, still *composed* per `mj_convert`) world
+  orientation is applied. Verified both analytically and empirically (an
+  identity-oriented object's cylinder now stands upright along MuJoCo's
+  +Z, matching the fixed mesh under the same identity orientation; for
+  random orientations the geom's resulting world symmetry axis matches
+  `R(q_gltf) @ (0, 1, 0)` to float64 precision) and physically
+  (`tests/test_cylinder_axis.py`: a cylinder dropped lying on its side
+  settles with its center a *radius*, not a *half-height*, above the
+  ground). `gltfworld.datagen.sample.object_support_offset` (used for
+  ground-clearance checks) is updated to match: local Y is now the height
+  axis, X/Z the radial plane. The crosscheck sample episode
+  (`tests/conftest.py:make_sample_episode`) now poses its cylinder lying on
+  its side rather than upright, specifically so a 90-degree axis mixup
+  between mesh and collider would be visually obvious (and IoU-detectable)
+  again if this ever regresses -- measured per-object crosscheck IoU for
+  that cylinder: **1.0000** (up from indistinguishable-by-coincidence
+  under the old, both-wrong convention).
 - `simulate(scene, initial_poses, T, record_hz, ...)`: runs at 500 Hz
   internal, records every `round(500 / record_hz)` steps (not necessarily
   exact when `record_hz` doesn't divide 500 evenly, e.g. the default 30 Hz
@@ -367,18 +393,47 @@ loudly instead of silently reporting a perfect score.
   `scene.dt`/`series.times` always reflect the *actual* recorded period,
   never a nominal value that doesn't match what was simulated).
 - **Ground-contact tolerances (found during V3 verification, documented as
-  a loosened tolerance, not silently relaxed).** The milestone's "never
-  sink more than 5mm below the ground plane at any recorded step" is
-  checked as a *steady-state* constraint (the last 20% of an episode's
-  frames), not literally every frame. A fresh, realistically-massed,
-  fast-falling object's very first ground impact produces genuine,
-  physically-inherent transient penetration well past 5mm under MuJoCo's
-  finite-stiffness soft-contact model -- measured up to ~21mm even after
-  tightening `solref`/`solimp` beyond MuJoCo's defaults -- before the
-  contact resolves over the next few steps; steady-state (settled)
-  penetration is consistently <0.1mm. `tests/test_episode_pipeline.py`
-  checks both: a loose 10cm "didn't fall through the floor" sanity bound
-  across every frame, and the tight 5mm bound restricted to settled frames.
+  a loosened tolerance, not silently relaxed; re-measured during V3.1
+  independent verification).** The milestone's "never sink more than 5mm
+  below the ground plane at any recorded step" is checked as a
+  *steady-state* constraint (the last 20% of an episode's frames), not
+  literally every frame. A fresh, realistically-massed, fast-falling
+  object's very first ground impact produces genuine, physically-inherent
+  transient penetration well past 5mm under MuJoCo's finite-stiffness
+  soft-contact model, before the contact resolves over the next few steps.
+  The originally-reported ~21mm (V3) was a **single-run example**, not a
+  worst case: independent re-measurement across a broader sweep of seeds
+  found transient penetration up to **~31mm** in some runs, and this
+  project's own follow-up sweep (200 `wm-scenes-v1` seeds, `steps=50`,
+  `hz=30`, on-plate cases only) found a worse case still -- **~84mm**, for
+  a small (`radius~3.6cm`), fast, dense cylinder taking a hard secondary
+  bounce (restitution 0.1 still permits *some* bounce). All of these stay
+  comfortably inside the loose 10cm "didn't fall through the floor" bound,
+  and every case checked settles to steady-state penetration <0.1mm --
+  consistent with the phenomenon being real, bounded contact-impact
+  transients (worse for smaller/faster/denser objects), not unbounded
+  sinking. The enforced bounds are unchanged (<=5mm steady-state, <=10cm
+  transient, per the milestone spec); only the "~21mm" prose example is
+  corrected here so it isn't mistaken for a measured worst case.
+  `tests/test_episode_pipeline.py` checks both: a loose 10cm "didn't fall
+  through the floor" sanity bound across every frame, and the tight 5mm
+  bound restricted to settled frames.
+- **Finite ground plate (not a bug, a scope boundary).** `wm-scenes-v1`'s
+  ground is a finite 6m x 6m plate (`_GROUND_HALF_EXTENTS`), not an
+  infinite plane. An object given enough linear/angular speed (up to the
+  sampled maxima of 1.5 m/s / 3 rad/s, or a cylinder that starts rolling on
+  its side and never stops) can cross the plate's edge and fall
+  indefinitely in a long-enough episode -- physically correct given a
+  finite plate, but it means `object_support_offset`-based "penetration"
+  checks stop being meaningful once an object is off the plate's footprint
+  (there's no ground there to penetrate). `wm-scenes-v1`'s own workspace
+  (objects start within `x, z in [-0.75, 0.75]`, well inside the 3m
+  half-extents) and the short episodes exercised by
+  `tests/test_episode_pipeline.py` (`steps=50`, `hz=30`, ~1.7s) don't
+  trigger this. Longer episodes (this project's own follow-up sweep used
+  `steps=100`, ~3.3s, and saw objects depart the plate in some seeds) would
+  need either a larger plate or a capped duration if this milestone's
+  episodes are ever lengthened.
 
 ## Milestones
 

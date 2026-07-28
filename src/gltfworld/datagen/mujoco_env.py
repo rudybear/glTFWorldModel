@@ -37,18 +37,34 @@ Known lossy/approximate mappings (documented per DESIGN.md):
   restitution 0; increasingly underdamped/"bouncier" as restitution rises).
   This is a documented, lossy approximation -- wm-scenes-v1 fixes
   restitution at a low 0.1, where it barely matters.
-- **Cylinder axis convention**: MuJoCo's native ``type="cylinder"`` geom is
-  symmetric about the geom's *local* Z axis. gltfworld's own visual mesh
-  (``gltfworld.scene.primitives.mesh_for("cylinder", ...)``, via trimesh's
-  default) is *also* Z-symmetric -- despite ``ObjectSpec``'s and the vendored
-  ``KHR_implicit_shapes`` cylinder schema's documented convention being
-  "height centered along the **Y** axis" (a pre-existing V1 mesh-generation
-  inconsistency, not something this milestone touches). This module
-  deliberately mirrors gltfworld's *actual* (Z-symmetric) convention -- the
-  same one ``gltfworld.render.crosscheck`` already uses -- so that physics
-  geometry, the renderer's visual mesh, and any cross-check of the two
-  agree for the same object. See the V3 report for the recommended V1
-  follow-up fix.
+- **Cylinder axis convention (fixed in V3.1)**: MuJoCo's native
+  ``type="cylinder"`` geom is symmetric about the geom's *local* Z axis and
+  that can't be changed -- it's a builtin primitive type. gltfworld's
+  contract convention (``ObjectSpec``, the ``KHR_implicit_shapes`` cylinder
+  schema's own text "centered along the Y axis", and -- since V3.1 -- the
+  actual trimesh-generated visual mesh) is symmetric about local **Y**.
+  V3 shipped with the visual mesh left *wrong* (also Z-symmetric) so it
+  would coincidentally match MuJoCo's native geom; that was a real,
+  externally-visible interop bug (a spec-conformant ``KHR_implicit_shapes``
+  reader reconstructs the collider centered on Y, so it would show the
+  cylinder rotated 90 degrees relative to gltfworld's own renderer, even
+  though gltfworld's *own* renderer and physics agreed with each other).
+  V3.1 fixes the mesh (see ``gltfworld.scene.primitives``) and instead
+  corrects the physics side here: every cylinder geom gets a fixed,
+  body-orientation-independent local ``quat`` (see
+  ``_CYLINDER_LOCAL_FIX_QUAT_WXYZ``, a -90 degree rotation about local X)
+  that re-centers MuJoCo's native Z-symmetric shape onto local Y *within
+  the body frame*, before the body's own orientation (composed via
+  :mod:`gltfworld.datagen.mj_convert`, unchanged) is applied. Verified
+  empirically and in ``tests/test_cylinder_axis.py``: with this local fix,
+  a cylinder given an identity gltf orientation stands upright along
+  mj's +Z, matching an upright Y-symmetric mesh under the same identity
+  orientation; for random orientations, the geom's resulting world-space
+  symmetry axis (mapped back through ``mj_vec_to_gltf``) matches
+  ``R(q_gltf) @ (0, 1, 0)`` to float64 precision -- i.e. exactly the axis
+  the corrected mesh sweeps out. ``gltfworld.render.crosscheck`` applies
+  the identical local fix to its own (separate, static-frame-only) MJCF
+  builder.
 """
 
 from __future__ import annotations
@@ -84,6 +100,29 @@ def shape_volume(shape: str, size) -> float:
     raise ValueError(f"unknown shape {shape!r}")
 
 
+# MuJoCo's native `type="cylinder"` geom is symmetric about the geom's
+# *local* Z axis and that can't be changed (it's a builtin primitive type,
+# not something MJCF lets you parameterize). gltfworld's contract convention
+# (ObjectSpec, the visual mesh, the KHR_implicit_shapes schema) is symmetric
+# about local **Y** instead. Rather than leaving the mesh wrong to match
+# MuJoCo (the old, since-removed V3 workaround), every cylinder geom gets a
+# fixed, body-orientation-independent local `quat` -- a -90 degree rotation
+# about local X -- that re-centers MuJoCo's native Z-symmetric shape onto
+# local Y *within the body frame*, before the body's own (correctly
+# *composed*, see mj_convert's module docstring) world orientation is
+# applied on top. Verified empirically (see the V3.1 report): with this
+# geom-local quat, a cylinder given `gltf_pose_to_mj`'s IDENTITY orientation
+# stands upright along mj's +Z (matching an upright, Y-symmetric gltf mesh
+# under the same identity orientation), and for a batch of random
+# orientations the geom's resulting world-space symmetry axis (mapped back
+# through `mj_vec_to_gltf`) matches `R(q_gltf) @ (0, 1, 0)` -- i.e. exactly
+# the axis the *actual* (post-fix) trimesh-generated mesh sweeps out --
+# to float64 precision.
+_CYLINDER_LOCAL_FIX_QUAT_WXYZ = (
+    f"{np.cos(-np.pi / 4.0):.17g} {np.sin(-np.pi / 4.0):.17g} 0 0"
+)
+
+
 def _geom_type_and_size(obj: ObjectSpec) -> tuple[str, str]:
     if obj.shape == "sphere":
         return "sphere", f"{obj.size[0]:.9g}"
@@ -91,10 +130,22 @@ def _geom_type_and_size(obj: ObjectSpec) -> tuple[str, str]:
         return "box", " ".join(f"{v:.9g}" for v in obj.size)
     if obj.shape == "cylinder":
         # size = [radius_bottom, half_height, radius_top]; MuJoCo's native
-        # cylinder geom takes "radius half-height" along its LOCAL Z axis
-        # (see module docstring re: the cylinder axis convention).
+        # cylinder geom takes "radius half-height" along its LOCAL Z axis --
+        # corrected to local Y (gltfworld's contract convention) by the
+        # fixed geom-local quat added in `_body_xml`, see
+        # `_CYLINDER_LOCAL_FIX_QUAT_WXYZ` above.
         return "cylinder", f"{obj.size[0]:.9g} {obj.size[1]:.9g}"
     raise ValueError(f"unsupported shape for MJCF: {obj.shape!r}")
+
+
+def _geom_local_quat_attr(obj: ObjectSpec) -> str:
+    """Extra ``quat="..."`` XML attribute text (with a leading space) for
+    ``obj``'s geom, or ``""`` for shapes that need no local-frame
+    correction (sphere/box are symmetric the same way in both engines
+    already -- see module docstring)."""
+    if obj.shape == "cylinder":
+        return f' quat="{_CYLINDER_LOCAL_FIX_QUAT_WXYZ}"'
+    return ""
 
 
 def _restitution_to_solref(restitution: float, timestep: float) -> str:
@@ -124,12 +175,13 @@ def _body_xml(obj: ObjectSpec, pos_mj: np.ndarray, quat_wxyz_mj: np.ndarray, tim
     pos_str = " ".join(f"{v:.9g}" for v in pos_mj)
     quat_str = " ".join(f"{v:.9g}" for v in quat_wxyz_mj)
     rgba_str = " ".join(f"{v:.9g}" for v in obj.color)
+    geom_local_quat = _geom_local_quat_attr(obj)
     name = f"obj_{obj.object_id}"
 
     if obj.is_static:
         return (
             f'<body name="{name}" pos="{pos_str}" quat="{quat_str}">'
-            f'<geom name="{name}" type="{geom_type}" size="{size_str}" rgba="{rgba_str}"/>'
+            f'<geom name="{name}" type="{geom_type}" size="{size_str}"{geom_local_quat} rgba="{rgba_str}"/>'
             f"</body>"
         )
 
@@ -141,7 +193,7 @@ def _body_xml(obj: ObjectSpec, pos_mj: np.ndarray, quat_wxyz_mj: np.ndarray, tim
         f'<body name="{name}" pos="{pos_str}" quat="{quat_str}">'
         f'<freejoint name="free_{obj.object_id}"/>'
         f'<geom name="{name}" type="{geom_type}" size="{size_str}" density="{density:.9g}" '
-        f'friction="{friction:.9g} 0.005 0.0001" solref="{solref}" solimp="{_SOLIMP}" rgba="{rgba_str}"/>'
+        f'friction="{friction:.9g} 0.005 0.0001" solref="{solref}" solimp="{_SOLIMP}"{geom_local_quat} rgba="{rgba_str}"/>'
         f"</body>"
     )
 

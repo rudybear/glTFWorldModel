@@ -179,8 +179,12 @@ def object_support_offset(obj: ObjectSpec, quat_xyzw: np.ndarray, direction_worl
     instead would spuriously flag a perfectly-resting box as "sunk below
     ground" whenever its half-diagonal exceeds its half-height.
 
-    Same local-Z-symmetric cylinder convention as
-    ``gltfworld.datagen.mujoco_env`` (see its module docstring).
+    Same local-Y-symmetric cylinder convention as ``ObjectSpec``/the visual
+    mesh/the physics geometry everywhere else (see
+    ``gltfworld.scene.primitives`` and ``gltfworld.datagen.mujoco_env``'s
+    module docstrings; fixed in V3.1 -- this function's cylinder branch
+    used to (incorrectly) treat local Z as the height axis to match the
+    pre-fix, buggy mesh/physics convention).
     """
     x, y, z, w = (float(v) for v in quat_xyzw)
     rot = np.array(
@@ -198,7 +202,7 @@ def object_support_offset(obj: ObjectSpec, quat_xyzw: np.ndarray, direction_worl
         return float(np.abs(d_local) @ obj.size.astype(np.float64))
     if obj.shape == "cylinder":
         radius, half_height, _ = (float(v) for v in obj.size)
-        return radius * math.hypot(d_local[0], d_local[1]) + half_height * abs(d_local[2])
+        return radius * math.hypot(d_local[0], d_local[2]) + half_height * abs(d_local[1])
     raise ValueError(f"unsupported shape {obj.shape!r}")
 
 

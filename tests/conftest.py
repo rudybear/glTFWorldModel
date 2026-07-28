@@ -20,6 +20,19 @@ RWM_SCHEMA_DIR = REPO_ROOT / "docs" / "schemas" / "rwm"
 _IDENTITY_QUAT = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 _SHAPES_CYCLE = ("sphere", "box", "cylinder")
 
+# 90 degree rotation about world Z: rotates the cylinder mesh's local
+# symmetry axis (Y, post-V3.1 fix -- see gltfworld.scene.primitives) onto
+# world -X, i.e. the cylinder falls lying on its side rather than upright.
+# A cylinder standing upright looks nearly identical whether the mesh/
+# collider convention is Y- or Z-symmetric (both put the round face up);
+# lying on its side makes a 90-degree axis mixup between the visual mesh
+# and the KHR_implicit_shapes-reconstructed (or MuJoCo-simulated) collider
+# obviously wrong instead -- see DESIGN.md "Cylinder axis convention" and
+# tests/test_crosscheck.py's per-object IoU check.
+_CYLINDER_ON_SIDE_QUAT = np.array(
+    [0.0, 0.0, np.sin(np.pi / 4.0), np.cos(np.pi / 4.0)], dtype=np.float32
+)
+
 
 def make_sample_episode(n_objects: int = 3, T: int = 30) -> Episode:
     """A deterministic sample episode: falling sphere/box/cylinder over a static ground box.
@@ -124,6 +137,11 @@ def make_sample_episode(n_objects: int = 3, T: int = 30) -> Episode:
         # "wm-scenes-v1"/V3 report). All objects must land inside the
         # frustum so every per-object IoU is a real, non-vacuous comparison.
         x = (i - (n + 1) / 2.0) * 0.9
+        # The cylinder falls lying on its side (see _CYLINDER_ON_SIDE_QUAT)
+        # so a 90-degree axis mixup between the visual mesh and the
+        # physics/KHR collider is actually visible; every other shape keeps
+        # the original identity orientation.
+        orientation = _CYLINDER_ON_SIDE_QUAT if objects[i].shape == "cylinder" else _IDENTITY_QUAT
         for t in range(T):
             time = times[t]
             vy = gravity_y * time
@@ -131,7 +149,7 @@ def make_sample_episode(n_objects: int = 3, T: int = 30) -> Episode:
             poses[t, i, 0] = x
             poses[t, i, 1] = y
             poses[t, i, 2] = 0.0
-            poses[t, i, 3:7] = _IDENTITY_QUAT
+            poses[t, i, 3:7] = orientation
             lin_vel[t, i, 1] = vy
 
     series = StateSeries(times=times, poses=poses, lin_vel=lin_vel, ang_vel=ang_vel)

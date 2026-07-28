@@ -42,10 +42,22 @@ from gltfworld.scene.episode import Episode  # noqa: E402
 # --- MJCF construction ---------------------------------------------------------
 
 
+# MuJoCo's native `type="cylinder"` geom is symmetric about local Z;
+# gltfworld's contract convention (mesh + KHR_implicit_shapes) is symmetric
+# about local Y. Same fixed geom-local correction as
+# `gltfworld.datagen.mujoco_env._CYLINDER_LOCAL_FIX_QUAT_WXYZ` (-90 degrees
+# about local X) -- kept as an independent copy here since this module
+# doesn't otherwise depend on `mujoco_env` (its MJCF builder is separate,
+# static-frame-only). See that module's docstring for the empirical
+# verification and DESIGN.md "Cylinder axis convention".
+_CYLINDER_LOCAL_FIX_QUAT_WXYZ = f"{np.cos(-np.pi / 4.0):.17g} {np.sin(-np.pi / 4.0):.17g} 0 0"
+
+
 def _geom_xml(obj, position_mj: np.ndarray, quat_wxyz_mj: np.ndarray) -> str:
     pos_str = " ".join(f"{v:.9g}" for v in position_mj)
     quat_str = " ".join(f"{v:.9g}" for v in quat_wxyz_mj)
     rgba_str = " ".join(f"{v:.9g}" for v in obj.color)
+    geom_local_quat = ""
 
     if obj.shape == "sphere":
         size_str = f"{obj.size[0]:.9g}"
@@ -56,12 +68,13 @@ def _geom_xml(obj, position_mj: np.ndarray, quat_wxyz_mj: np.ndarray) -> str:
     elif obj.shape == "cylinder":
         size_str = f"{obj.size[0]:.9g} {obj.size[1]:.9g}"  # radius, half-height
         geom_type = "cylinder"
+        geom_local_quat = f' quat="{_CYLINDER_LOCAL_FIX_QUAT_WXYZ}"'
     else:
         raise ValueError(f"unsupported shape for MJCF mirror: {obj.shape!r}")
 
     return (
         f'<body name="body_{obj.object_id}" pos="{pos_str}" quat="{quat_str}">'
-        f'<geom name="obj_{obj.object_id}" type="{geom_type}" size="{size_str}" '
+        f'<geom name="obj_{obj.object_id}" type="{geom_type}" size="{size_str}"{geom_local_quat} '
         f'rgba="{rgba_str}"/></body>'
     )
 
