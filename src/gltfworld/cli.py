@@ -3,8 +3,8 @@
 ``validate`` and ``inspect`` are real as of milestone V1 (the glTF transport
 codec); ``render`` and ``crosscheck`` are real as of milestone V2 (the
 headless renderer); ``generate`` is real as of milestone V3 (MuJoCo
-data generation); ``stats`` remains a V0-style stub until its milestone
-lands.
+data generation); ``stats`` is real as of the dataset/provenance/stats
+milestone (V4 per the pre-training-gate scheme).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-_STUB_SUBCOMMANDS = ("stats",)
+_STUB_SUBCOMMANDS: tuple[str, ...] = ()
 
 GLTF_VALIDATOR_VERSION = "2.0.0-dev.3.10"
 _VALIDATOR_URL_TEMPLATE = (
@@ -172,6 +172,29 @@ def _cmd_generate(out: str, episodes: int, seed: int, steps: int, hz: float, ren
     return 0
 
 
+def _cmd_pack(episodes_dir: str, out_file: str, n_max: int) -> int:
+    from gltfworld.data.pack import pack_dataset
+
+    result = pack_dataset(episodes_dir, out_file, n_max=n_max)
+    print(
+        f"gltfworld pack: wrote {result.out_file} ({result.count} episodes, "
+        f"T={result.t}, N_max={result.n_max}) + {result.meta_path}"
+    )
+    print(f"split sizes: {result.split_counts}")
+    return 0
+
+
+def _cmd_stats(pack_file: str, as_json: bool) -> int:
+    from gltfworld.data.stats import compute_stats, format_human
+
+    report = compute_stats(pack_file)
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_human(report))
+    return 0 if report["nan_inf_count"] == 0 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gltfworld")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -211,6 +234,15 @@ def main(argv: list[str] | None = None) -> int:
         "--size", type=int, default=256, help="square render size in pixels when --render is passed (default 256)"
     )
 
+    pack_parser = subparsers.add_parser("pack", help="pack a directory of ep_*.glb episodes into one safetensors file")
+    pack_parser.add_argument("episodes_dir", help="directory of ep_*.glb episodes (+ manifest.json)")
+    pack_parser.add_argument("--out", required=True, dest="out_file", help="output .safetensors path")
+    pack_parser.add_argument("--n-max", type=int, default=5, help="pad object dimension to this many dynamic objects (default 5)")
+
+    stats_parser = subparsers.add_parser("stats", help="report dataset statistics for a packed dataset")
+    stats_parser.add_argument("pack_file", help="path to a packed .safetensors file (see `gltfworld pack`)")
+    stats_parser.add_argument("--json", action="store_true", dest="as_json", help="emit machine-readable JSON")
+
     for name in _STUB_SUBCOMMANDS:
         sub = subparsers.add_parser(name)
         sub.add_argument("args", nargs=argparse.REMAINDER)
@@ -229,6 +261,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_generate(
             parsed.out, parsed.episodes, parsed.seed, parsed.steps, parsed.hz, parsed.render, parsed.size
         )
+    if parsed.command == "pack":
+        return _cmd_pack(parsed.episodes_dir, parsed.out_file, parsed.n_max)
+    if parsed.command == "stats":
+        return _cmd_stats(parsed.pack_file, parsed.as_json)
 
     print(f"gltfworld {parsed.command}: not implemented yet (milestone V1+)")
     return 2

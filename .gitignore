@@ -6,8 +6,12 @@ __pycache__/
 dist/
 *.egg-info/
 
-# project data / outputs (root-level only; does not affect src/gltfworld/data/)
-/data/
+# project data / outputs (root-level only; does not affect src/gltfworld/data/).
+# `/data/*` (not `/data/`) so the `!/data/README.md` negation below actually
+# works -- git won't descend into a wholly-ignored directory to apply a
+# negation pattern for a file inside it.
+/data/*
+!/data/README.md
 /out/
 /runs/
 

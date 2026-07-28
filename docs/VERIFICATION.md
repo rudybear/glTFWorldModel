@@ -413,3 +413,235 @@ one) -- they all run under the default `-m "not gpu"`, including in CI
   on load; no errors in the browser's developer console. `out/` is
   git-ignored (see `.gitignore`), so this file is never committed -- it's
   a one-off local artifact for this manual check.
+
+## V4 -- dataset build, provenance, stats, metric harness (pre-training gate)
+
+This milestone builds everything the PRE-TRAINING GATE checks before any
+model-training code (V5+) is allowed to start: the tensor contract episodes
+are converted to for training, real packed datasets, dataset-level
+statistics, and an independently cross-validated eval-metrics module. See
+`docs/PRETRAINING_GATE.md` for the assembled checklist with actual observed
+values; this section is the narrative/how-it-was-verified writeup.
+
+### Checkpoint: tensor contract round trip
+
+- **Purpose**: confirm `gltfworld.scene.contract.episode_to_tensors`/
+  `tensors_to_state` (the `D=22` per-object state layout every downstream
+  dataset/model consumes) losslessly round-trips the dynamic part of an
+  Episode -- pose, velocities, shape/size, mass/friction/restitution,
+  gravity/dt/camera -- to <= 1e-6 relative error, and that static objects
+  (the ground) are excluded from `states` and land in the separate
+  `static` sub-dict instead.
+- **Command**: `uv run pytest tests/test_contract.py -v`
+- **Expected result**: all 7 tests pass, including
+  `test_round_trip_dynamic_part` parameterized over `(n_objects, T) in
+  {(1,1), (3,30), (5,50)}`. Observed: **all 7 pass**.
+
+### Checkpoint: provenance -- training tensors match what's actually on disk
+
+- **Purpose**: confirm the tensor contract computed from a freshly
+  simulated in-memory `Episode` matches the tensor contract computed from
+  that same episode after a real save-to-GLB/load-from-GLB round trip, to
+  <= 1e-6 absolute (fp32) -- i.e. that the `.glb` files a training pipeline
+  reads are a faithful record of what MuJoCo actually produced, not merely
+  "close" to it.
+- **Command**: `uv run pytest tests/test_provenance.py -v` (needs the
+  `sim` extra; 5 freshly simulated episodes, seeds 90210-90214)
+- **Expected result**: all 5 pass. Observed: **all 5 pass**, states and
+  globals within 1e-6 absolute, static (ground) fields within 1e-6 too.
+
+### Checkpoint: dataset packing (`pack_dataset` + `DynamicsDataset`/`PerceptionDataset`)
+
+- **Purpose**: confirm a directory of `ep_*.glb` episodes packs into one
+  safetensors file with correct padding (`mask`/`class_ids` padding
+  respected), a deterministic seed-keyed 90/5/5 split, and a
+  `pack_meta.json` sidecar recording enough provenance (source manifest
+  hash, `N_max`/`D`/count/split scheme/ground geometry) to make the packed
+  file self-describing; and that the torch `Dataset` classes built on top
+  read it back correctly (transition/sequence modes, memory-mapped
+  rendered frames).
+- **Command**: `uv run pytest tests/test_data.py -v -m "not gpu"` (pack/
+  split/dataset-class tests, no MuJoCo/GPU needed) and
+  `uv run pytest tests/test_data.py -v -m gpu` (the `PerceptionDataset`
+  test, needs a real renderer)
+- **Expected result**: all pass. Observed: **4 non-gpu + 1 gpu, all pass**.
+
+### Checkpoint: real dataset generation
+
+- **Purpose**: actually generate (not just unit-test) the two datasets this
+  milestone promises, and report real wall time/throughput/disk usage --
+  see `data/README.md` for the exact pinned commands.
+- **Command**: see `data/README.md`.
+- **Expected result / observed**:
+  - `dynamics-v1`: 10,000 episodes, states only. **271.91s (4.53 min)** to
+    generate, **636M** on disk. Packed: **421M** safetensors + 161K
+    `pack_meta.json`, **115.18s** to pack. Split: train 8992 / val 532 /
+    test 476.
+  - `perception-v1`: 500 episodes with rendered 256x256 rgb+seg+depth
+    frames. **127.87s (2.13 min)** to generate+render (~391 combined
+    frames/s on this machine's RTX PRO 6000 Blackwell), **22G** on disk.
+    Packed: **22M** safetensors + 9K `pack_meta.json`, **5.59s** to pack
+    (packing only touches the tensor contract; rendered frames are read
+    memory-mapped from each episode's own directory, not duplicated into
+    the packed file). Split: train 458 / val 27 / test 15.
+  - Validator sampling (see next checkpoint) and `gltfworld stats` (see
+    below) were run against both real datasets, not just synthetic test
+    fixtures.
+
+### Checkpoint: validator, 0 errors, sampled from both real datasets
+
+- **Purpose**: confirm real, at-scale generated episodes (not just the
+  handful exercised by V3's own `test_episode_pipeline.py`) are still
+  spec-valid glTF according to the independent, pinned glTF-Validator.
+- **Command**: 20 episodes sampled (`random.seed(0)`) from each of
+  `data/dynamics-v1/episodes/` and `data/perception-v1/episodes/`, each run
+  through `uv run gltfworld validate <path>`.
+- **Expected result**: `numErrors == 0` for all 40 sampled episodes.
+  Observed: **0/20 dynamics-v1 episodes with numErrors != 0; 0/20
+  perception-v1 episodes with numErrors != 0**.
+
+### Checkpoint: `gltfworld stats` -- dataset sanity report
+
+- **Purpose**: a single command that reports everything the gate needs to
+  know about a packed dataset's health: 0 NaN/Inf, per-shape/class
+  balance, physically plausible position/velocity/mass/friction ranges,
+  ground-penetration bounds holding (per DESIGN.md's steady-state/
+  transient split), and an energy-dissipation sanity trend -- in both a
+  human-readable table and `--json` machine format.
+- **Command**: `uv run gltfworld stats <packed_file>[.safetensors]
+  [--json]`; unit-tested by `uv run pytest tests/test_stats.py -v`.
+- **Expected result / observed** (full numbers in
+  `docs/PRETRAINING_GATE.md`; summarized here):
+  - Both datasets: **0 NaN/Inf** (hard requirement, met).
+  - `dynamics-v1`: steady-state penetration <= 5mm for **99.95%** of
+    episodes; transient penetration <= 100mm for **99.99%**; smoothed
+    total energy non-increasing for **99.99%** of episodes.
+  - `perception-v1`: steady-state <= 5mm for **99.80%**; transient <=
+    100mm for **100.00%**; energy non-increasing for **100.00%**.
+  - **Documented scope-boundary finding, not a bug**: at `--steps 100
+    --hz 30` (~3.3s/episode), `wm-scenes-v1`'s *finite* 6x6m ground plate
+    (DESIGN.md "Finite ground plate") is genuinely departed by at least
+    one object in **14.02%** of `dynamics-v1` episodes and **12.60%** of
+    `perception-v1` episodes -- exactly the behavior DESIGN.md's own
+    earlier 100-step follow-up sweep predicted. `gltfworld stats` excludes
+    those off-plate object-frames from the penetration checks above
+    (there is no ground under them to "penetrate") and reports the
+    departure rate as its own separate, visible metric
+    (`off_plate_object_frame_fraction`/`episodes_with_departure_fraction`)
+    instead of silently filtering it out of the denominator.
+
+### Checkpoint: eval metrics (PSNR/SSIM/MSE), cross-validated
+
+- **Purpose**: confirm gltfworld's own from-scratch PSNR/SSIM
+  implementations (`gltfworld.eval.metrics`) -- the canonical numbers every
+  later perception-quality eval (V7+) will report -- are numerically
+  correct, not just plausible-looking, by cross-validating against
+  independent reference implementations.
+- **Command**: `uv run pytest tests/test_metrics.py -v`
+- **Expected result**: PSNR matches `skimage.metrics.peak_signal_noise_ratio`
+  exactly (same `data_range=255` convention) on random and structured
+  (base image + Gaussian noise) image pairs, grayscale and RGB; SSIM
+  matches `skimage.metrics.structural_similarity` (Wang et al. 2004
+  parameters: `gaussian_weights=True, sigma=1.5, use_sample_covariance=False,
+  K1=0.01, K2=0.03`, `data_range=255`) within 1e-6; PSNR additionally
+  cross-checked against `torchmetrics.image.PeakSignalNoiseRatio` (float32
+  precision, ~1e-3 tolerance) as a second, independent reference.
+  **torchmetrics' SSIM is deliberately not required to match** (see
+  `tests/test_metrics.py`'s comment): it pads instead of cropping the
+  gaussian-filtered SSIM map at image borders, a real, benign difference in
+  border-handling convention between the two reference libraries
+  themselves, not a bug in either -- skimage is this project's designated
+  primary SSIM anchor. Observed: **all 11 tests pass** (property tests run
+  40/40 and 20/20 Hypothesis examples respectively for the random/
+  structured PSNR and SSIM checks).
+
+### Checkpoint: external metric replication -- attempted (CLEVRER/SlotFormer)
+
+- **Purpose**: the spec asked for an attempt to reproduce SlotFormer's
+  published CLEVRER video-prediction PSNR (30.21) within +/-0.2 using their
+  released rollout artifacts/pretrained weights, timeboxed so a
+  download/access failure doesn't burn the milestone.
+- **What was attempted**: fetched and read
+  `github.com/pairlab/SlotFormer`'s README and `docs/{data,benchmark,install}.md`
+  (all reachable, no auth needed) to find the actual reproduction path.
+- **What actually blocks full reproduction** (recorded honestly, not
+  glossed over):
+  1. Pretrained weights and precomputed slot artifacts
+     (`pretrained.zip`, `slots/clevrer_slots.pkl`,
+     `slots/rollout_clevrer_slots.pkl`) are hosted on a Google Drive
+     *folder* link
+     (`https://drive.google.com/drive/folders/15y21miKZsAVHOSQEZLbUBWRrsZzcd5QW`).
+     `curl`ing that URL returns an empty, JS-rendered Google Drive web-app
+     shell (HTTP 200, `content-length: 0` on the meaningful body) --
+     listing/downloading real folder contents needs either a browser
+     session or the Google Drive API with OAuth credentials, neither
+     available in this environment. A direct `uc?export=download&id=<folder
+     id>` request (the common single-file trick) returned **HTTP 500**
+     with 0 bytes, as expected for a folder id rather than a file id.
+  2. The raw CLEVRER dataset itself (`Training/Validation Videos,
+     Annotations`, required regardless of pretrained-weight access, per
+     `docs/data.md`) is hosted at `clevrer.csail.mit.edu`, which timed out
+     at the TCP connect stage from this sandbox
+     (`curl -v --connect-timeout 8 http://clevrer.csail.mit.edu/` ->
+     `Failed to connect to clevrer.csail.mit.edu port 80 after 8002 ms:
+     Timeout was reached`, both `http://` and `https://`) -- host resolves
+     (`128.52.131.62`) but the connection itself never completes, i.e. this
+     is a genuine network-reachability failure, not a 4xx/5xx from the
+     server.
+  3. Even with data/weights in hand, SlotFormer's own reproduction
+     pipeline (`docs/install.md`) pins a materially different, older stack
+     (PyTorch 1.10.1 + CUDA 11.3, `einops==0.3.2`, `phyre==0.2.2`, the
+     unpublished `nerv` training-loop package at a pinned git tag) that
+     would need a separate environment from this project's own (PyTorch
+     2.13, Python 3.12) to run at all.
+- **Outcome**: per the spec's own timeboxing instruction, this was
+  **not** pursued further (no partial/fudged number is reported in its
+  place). The skimage/torchmetrics cross-validation above (PSNR exact,
+  SSIM within 1e-6 against Wang et al. 2004's own reference implementation)
+  is this milestone's metric-correctness anchor; the Physion replication
+  planned for V8 remains gltfworld's primary *external* anchor, per the
+  spec.
+
+### Checkpoint: pre-training gate assembly
+
+- **Purpose**: one document collecting every check above (plus the V1-V3
+  checkpoints it depends on) into a single pass/fail checklist before any
+  training code starts.
+- **Command**: see `docs/PRETRAINING_GATE.md`.
+- **Expected result**: every item's actual observed value is recorded next
+  to its expected result; overall verdict recorded at the top.
+
+### Checkpoint: CI
+
+- **Purpose**: confirm the local dev environment isn't the only place this
+  milestone's tests pass.
+- **Finding**: `gh run list --limit 5` showed the `test` job failing on
+  *every* run since V0, including runs re-triggered on pre-V4 commits --
+  **pre-existing, not caused by this milestone**. Root cause: `import
+  mujoco` (mujoco 3.11, unpinned upper bound in `pyproject.toml`) now
+  unconditionally imports `mujoco.rendering.classic.renderer` ->
+  `mujoco.egl` -> `OpenGL.EGL`'s raw ctypes bindings, which load
+  `libEGL.so.1` at *module import time*. mujoco's own `try/except
+  ImportError` guard around that import does not catch the failure mode
+  that shows up on a runner with no EGL/GL system libraries at all (plain
+  `ubuntu-latest`): PyOpenGL's ctypes loader resolves to `None` and then
+  raises `AttributeError` (not `ImportError`) reading an attribute off it,
+  which propagates straight through mujoco's guard and pytest's
+  `importorskip`, breaking collection of every module that does a bare
+  `import mujoco` (`gltfworld.datagen.*`) -- silently invalidating the
+  documented "MuJoCo's core physics API needs no GPU/EGL context"
+  assumption (DESIGN.md/V3) the moment the CI image lacks any EGL library
+  at all, not because of anything this milestone's own tests do.
+- **Fix applied**: `.github/workflows/ci.yml`'s `test` job now installs
+  `libegl1 libgl1` (a real, if software, EGL/GL runtime) before `uv sync`,
+  and also adds `--extra ml` to the CI sync (this milestone's dataset/
+  metrics tests need `torch`/`safetensors`/`scikit-image`/`torchmetrics`,
+  none of which were previously installed in CI).
+- **Caveat, stated plainly**: per this milestone's rules, **no commit here
+  is pushed**, so `gh run list --limit 1` at the time of writing still
+  shows the last *pushed* commit's (pre-V4) run, which fails for the
+  reason above -- the CI fix is committed locally alongside everything
+  else and will apply the next time someone pushes. This checkpoint is
+  therefore recorded as **not independently green on GitHub yet** in
+  `docs/PRETRAINING_GATE.md`, with the above root-cause/fix documented so
+  it isn't mistaken for silence/oversight.

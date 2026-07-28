@@ -27,10 +27,15 @@ custom extensions are needed to fill in.
 
 ## Status
 
-V2 — headless renderer (rgb + segmentation + depth via vendored, patched
-pyrender; MuJoCo cross-render oracle; `render`/`crosscheck` CLI) on top of
-the V1 glTF transport codec (pose animation + KHR physics +
-`RWM_state_series`) — see [docs/VERIFICATION.md](docs/VERIFICATION.md).
+V4 — dataset build + provenance + stats + metric harness, feeding the
+pre-training gate ([docs/PRETRAINING_GATE.md](docs/PRETRAINING_GATE.md)):
+tensor contract + provenance-verified GLB round trip, real `dynamics-v1`
+(10k episodes)/`perception-v1` (500 rendered episodes) datasets, `pack`/
+`stats` CLIs, cross-validated PSNR/SSIM. Built on top of V3 (MuJoCo episode
+generation), V2 (headless renderer: rgb/seg/depth via vendored, patched
+pyrender; MuJoCo cross-render oracle), and V1 (glTF transport codec: pose
+animation + KHR physics + `RWM_state_series`) — see
+[docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Setup
 

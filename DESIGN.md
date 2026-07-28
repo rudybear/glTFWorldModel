@@ -437,17 +437,100 @@ loudly instead of silently reporting a perfect score.
 
 ## Milestones
 
-- **V0** — project scaffold, CI, verification protocol.
-- **V1** — glTF I/O layer: load/save/validate real GLB files; `validate`/`inspect` CLI work.
+**Renumbering note**: the original plan below (drafted at V0) allotted
+separate milestones (originally numbered V4-V6) to the
+`RWM_state_series` codec, the KHR physics codec, and MuJoCo-episode glue.
+In practice all three landed together as part of **V1** (see "Custom
+components" above -- `gltfworld.ext.rwm`, `gltfworld.ext.khr_physics`, and
+`gltfworld.scene.convert` are all implemented and independently verified
+as of V1's own checkpoints in `docs/VERIFICATION.md`). Rather than leave
+three stale, already-completed line items in this list, V4 onward is
+renumbered starting from what's actually next after V3; nothing described
+below was silently dropped, it just already happened earlier than
+originally planned.
+
+- **V0** (done) — project scaffold, CI, verification protocol.
+- **V1** (done) — glTF transport codec: pose animation +
+  `KHR_physics_rigid_bodies`/`KHR_implicit_shapes` + `RWM_state_series`,
+  all with schema validation; `validate`/`inspect` CLI work. (Absorbed what
+  this list originally planned as separate V4/V5/V6 milestones -- see the
+  renumbering note above.)
 - **V2** (done) — vendored, patched pyrender renders episodes headlessly
   (rgb/seg/depth, 256x256); `render`/`crosscheck` CLI work; MuJoCo
   cross-render oracle; benchmark. See "Rendering (V2)" above.
 - **V3** (done) — MuJoCo episode generation; `generate` CLI produces GLB
   episodes. See "MuJoCo data generation (V3)" above.
-- **V4** — `RWM_state_series` extension: encode/decode + schema validation.
-- **V5** — KHR physics extension codec (rigid bodies + implicit shapes).
-- **V6** — episode glue: full MuJoCo -> GLB round trip, `crosscheck` CLI.
-- **V7** — perception model: frames -> scene state.
-- **V8** — dynamics model: state[t] -> state[t+1].
-- **V9** — inference loop: model output -> glTF -> renderer, closed loop.
-- **V10** — gap report + RWM extension write-up; PoC evaluation (`stats`, `eval`).
+- **V4** (done) — dataset build + provenance + stats + metric harness,
+  feeding the pre-training gate: tensor contract (`gltfworld.scene.contract`),
+  dataset packing/loading (`gltfworld.data.pack`/`.dataset`), real
+  `dynamics-v1`/`perception-v1` datasets, `stats` CLI, cross-validated
+  PSNR/SSIM (`gltfworld.eval.metrics`). See "Dataset build (V4)" below,
+  `docs/PRETRAINING_GATE.md`, and `docs/VERIFICATION.md`'s V4 section.
+- **V5** — perception model: frames -> scene state.
+- **V6** — dynamics model: state[t] -> state[t+1].
+- **V7** — inference loop: model output -> glTF -> renderer, closed loop.
+- **V8** — external eval anchor: Physion replication (the primary
+  *external* correctness anchor for this project's eval numbers, per V4's
+  own metric-cross-validation note).
+- **V9** — gap report + RWM extension write-up; PoC evaluation wrap-up.
+
+## Dataset build (V4)
+
+Everything needed to justify starting model training lives behind
+`docs/PRETRAINING_GATE.md`; this section is the short factual summary
+(full narrative in `docs/VERIFICATION.md`'s V4 section).
+
+- **Tensor contract** (`gltfworld.scene.contract`): `episode_to_tensors`/
+  `tensors_to_state` turn an `Episode` into `states float32 (T, N, D=22)`
+  (pos(3) + hemisphere-normalized quat xyzw(4) + lin_vel(3) + ang_vel(3) +
+  shape-onehot(3) + size(3) + log_mass(1) + friction(1) + restitution(1)),
+  `mask bool (N,)`, `class_ids int64 (N,)` (`{"ball": 0, "crate": 1,
+  "cylinder": 2}`), and `globals float32 (G=12,)` (gravity(3) + dt(1) +
+  camera position(3)+rotation(4)+yfov(1)); static objects (the ground) are
+  excluded from `states` and carried in a separate `static` sub-dict
+  instead. Verified round-trip <= 1e-6 relative (`tests/test_contract.py`)
+  and, more importantly, verified against the *actual glTF files on disk*
+  (`tests/test_provenance.py`: simulate -> keep in-memory series -> save
+  GLB -> load GLB -> compare tensor contract from both paths, <= 1e-6
+  absolute).
+- **Packing** (`gltfworld.data.pack.pack_dataset`): one directory of
+  `ep_*.glb` -> one `safetensors` file (`states`/`mask`/`class_ids`/
+  `globals`/`split_id`/`seeds`, padded to `N_max=5`) + a `pack_meta.json`
+  sidecar (source manifest sha256, `N_max`/`D`/count/`T`, ground
+  top-Y/footprint, and the split scheme). Split is a deterministic 90/5/5
+  train/val/test bucketing of `sha256("gltfworld-split-v1:" +
+  episode_seed)`'s first 8 hex digits (keyed by each episode's own
+  `SceneState.seed`, not its position in the file -- see
+  `gltfworld.data.pack.split_id_for_seed`).
+- **Datasets, generated for real** (not just unit-tested; see
+  `data/README.md` for exact pinned commands and `docs/PRETRAINING_GATE.md`
+  for full stats):
+  - `dynamics-v1`: 10,000 episodes, states only (`--steps 100 --hz 30`,
+    seed `20260727`). Generated in 4.53 min, 636M on disk; packed to 421M
+    in 115.18s. Split: train 8992 / val 532 / test 476.
+  - `perception-v1`: 500 episodes with rendered 256x256 rgb+seg+depth
+    frames (seed `20260728`). Generated+rendered in 2.13 min (~391 combined
+    frames/s), 22G on disk; packed (states only, frames stay
+    memory-mapped from their own `.npy` files) to 22M in 5.59s. Split:
+    train 458 / val 27 / test 15.
+  - Both datasets: 0 NaN/Inf; steady-state ground-penetration <= 5mm holds
+    for 99.95%/99.80% of episodes respectively (contact-transient outliers
+    documented, not silently dropped -- see "Ground-contact tolerances"
+    above); smoothed total energy non-increasing for 99.99%/100.00% of
+    episodes. A real, DESIGN.md-predicted fraction of episodes
+    (14.02%/12.60%) have an object depart `wm-scenes-v1`'s *finite* ground
+    plate at `--steps 100`; `gltfworld stats` excludes those frames from
+    the penetration checks (there's no ground there to penetrate) and
+    reports the departure rate as its own explicit metric instead of
+    hiding it.
+- **`gltfworld stats`** (`gltfworld.data.stats`): episode/transition
+  counts, per-shape/class histograms, position/velocity/mass/friction
+  ranges, NaN/Inf count, steady-state/transient ground-penetration
+  fractions, energy trend, split sizes -- human table or `--json`.
+- **Eval metrics** (`gltfworld.eval.metrics`): from-scratch MSE/PSNR/SSIM,
+  cross-validated against `skimage` (PSNR exact, SSIM within 1e-6 at Wang
+  et al. 2004's own parameters) and `torchmetrics` (PSNR, supplementary).
+  A CLEVRER/SlotFormer external replication was attempted and honestly
+  documented as blocked (Google Drive folder gating, `clevrer.csail.mit.edu`
+  unreachable from this environment, and an incompatible pinned training
+  stack) rather than faked -- see `docs/VERIFICATION.md`.
