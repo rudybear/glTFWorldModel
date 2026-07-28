@@ -11,6 +11,11 @@ dependencies = ["numpy>=1.26", "pygltflib>=1.16.5", "trimesh>=4.0"]
 [project.optional-dependencies]
 sim = ["mujoco>=3.1"]
 ml = ["torch>=2.3", "safetensors>=0.4", "scipy>=1.11", "imageio[ffmpeg]>=2.34"]
+# Runtime deps of the vendored pyrender (src/gltfworld/_vendor/pyrender, see
+# PROVENANCE.md): exactly what the vendored code imports on the paths
+# gltfworld exercises. Deliberately excludes pyglet (guarded out; only the
+# interactive Viewer needs it) and scipy (not imported by pyrender itself).
+render = ["PyOpenGL>=3.1", "Pillow>=10", "freetype-py>=2.3", "networkx>=3.0", "six>=1.16"]
 
 [dependency-groups]
 dev = ["pytest>=8", "hypothesis>=6", "jsonschema>=4"]
@@ -27,3 +32,6 @@ packages = ["src/gltfworld"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "gpu: requires a GPU + working EGL offscreen context (skipped in CI, run locally: `uv run pytest -v`; excluded with `-m \"not gpu\"`)",
+]

@@ -1,6 +1,6 @@
 # DESIGN
 
-Status: 2026-07-27, milestone V1.
+Status: 2026-07-27, milestone V2.
 
 ## Architecture flow
 
@@ -27,7 +27,12 @@ an implementation detail, it's the thing under study.
   generation; avoids writing a physics engine to get training data.
 - **vendored pyrender (V2)** — headless GL rendering of glTF scenes without
   building a renderer from scratch; vendored (not a dependency) so it can be
-  patched for extension-aware rendering.
+  patched for extension-aware rendering. Pinned commit
+  `a59963ef890891656fd17c90e12d663233dcaa99` (mmatl/pyrender, latest
+  `master` as of vendoring); full patch list in
+  `src/gltfworld/_vendor/PROVENANCE.md` (numpy-2 `np.infty` removal,
+  optional/guarded `pyglet` import so headless use needs no windowing
+  toolkit, and intra-package import fixes the vendoring itself required).
 - **PyTorch** — standard ML framework for perception/dynamics models.
 
 ## Custom components
@@ -134,11 +139,79 @@ One `Episode` (`gltfworld.scene.episode`) = one GLB, built by
   A real caller putting an empty string into `ObjectSpec.parts` will not get
   it back after a real GLB save/load round trip.
 
+## Rendering (V2)
+
+`gltfworld.render.renderer.EpisodeRenderer` turns an in-memory `Episode`
+into rgb/depth/seg frames via the vendored pyrender (pinned commit, patch
+list: `src/gltfworld/_vendor/PROVENANCE.md`). Nothing outside
+`gltfworld._vendor` imports pyrender directly.
+
+- **EGL setup**: `gltfworld.render.renderer` sets `PYOPENGL_PLATFORM=egl`
+  (only if unset) *before* importing the vendored package. If
+  `__EGL_VENDOR_LIBRARY_FILENAMES` isn't already set by the caller, it
+  globs `/usr/share/glvnd/egl_vendor.d/*.json` for a filename mentioning
+  "nvidia" and points that env var at it (never hardcodes a path — ICD
+  filenames vary by distro/driver package) so libglvnd doesn't hand the
+  context off to a software/Mesa ICD instead. `egl_info()` reports what
+  actually ended up active (`GL_VENDOR`/`GL_RENDERER`/`GL_VERSION` read
+  back from a live context, not just env-var introspection) — see
+  `docs/VERIFICATION.md` V2 "EGL device info".
+- **Seg encoding**: pyrender's `RenderFlags.SEG` pass paints each tracked
+  node a flat, unlit color instead of shading it, so gltfworld encodes a
+  `uint16` `object_id` directly into that (r, g, b) color as
+  `(object_id & 0xFF, (object_id >> 8) & 0xFF, 0)` and decodes with
+  `object_id = r + g * 256`. Background (no geometry hit) is `(0, 0, 0)` ->
+  `object_id == 0`, which means an `ObjectSpec` whose `object_id` is
+  legitimately `0` (the ground plane in
+  `tests/conftest.py:make_sample_episode`) is indistinguishable from
+  background in the seg buffer alone — a pre-existing V1 modeling choice
+  (ground assigned id 0), not something the seg encoding can special-case
+  without lying about a real object's id. Code that needs "is there any
+  geometry here at all" (e.g. the MuJoCo crosscheck's binary silhouette)
+  uses `depth > 0` instead of the seg channel, which has no such aliasing.
+- **One renderer per process**: pyrender's EGL platform binds to the
+  *shared default* EGL display, and deleting any one
+  `EpisodeRenderer`/`OffscreenRenderer` instance terminates that shared
+  display for every other still-open instance in the same process
+  (confirmed empirically, not just a suspicion — see
+  `EpisodeRenderer`'s docstring in `src/gltfworld/render/renderer.py`).
+  Not patched (would need global refcounting of the shared display); the
+  renderer, benchmark, and cross-check all treat one `EpisodeRenderer` as a
+  process-wide singleton instead (the test suite shares one across all
+  gpu-marked tests via a session-scoped fixture).
+- **Camera aspect**: renders are always square (`width == height`), so
+  `EpisodeRenderer` uses `aspectRatio = width / height` for the camera
+  projection rather than the episode's stored `CameraSpec.aspect` (which
+  describes the scene's *authoring* aspect ratio, not this renderer's
+  output) — keeps circular silhouettes circular, which the analytic tests
+  (and any square-pixel consumer) need.
+- **MuJoCo crosscheck coordinate conversion**
+  (`gltfworld.render.crosscheck.gltf_pose_to_mujoco`): glTF is Y-up,
+  right-handed, quaternion (x, y, z, w); MuJoCo is Z-up, right-handed,
+  quaternion (w, x, y, z). The two world frames are related by one fixed
+  +90 degree rotation about the shared X axis
+  (`(x, y, z)_gltf -> (x, -z, y)_mujoco`, a proper rotation — determinant
+  +1, not a reflection, so it preserves handedness). MuJoCo's camera
+  convention already matches glTF/OpenGL (looks down local -Z, local +Y
+  up), so the same conversion applies uniformly to object poses and the
+  camera; unit-tested in `tests/test_crosscheck.py`. Measured binary
+  silhouette IoU against MuJoCo's independent renderer on
+  `make_sample_episode()`'s frame 0: **0.9962** (threshold: >= 0.98).
+- **Performance**: persistent renderer, 4-object scene, 500 frames,
+  256x256, measured on this machine's RTX PRO 6000 Blackwell:
+  rgb+depth+seg **639.5 fps** (hard floor 100, target 300 — both cleared).
+  See `docs/VERIFICATION.md` V2 "benchmark" for the full breakdown
+  (rgb-only and rgb+depth land at the same fps — pyrender's offscreen path
+  always reads back color and depth together unless `DEPTH_ONLY` is set,
+  so there's no cheaper rgb-only path through the public API).
+
 ## Milestones
 
 - **V0** — project scaffold, CI, verification protocol.
 - **V1** — glTF I/O layer: load/save/validate real GLB files; `validate`/`inspect` CLI work.
-- **V2** — vendored renderer produces frames from a static glTF scene.
+- **V2** (done) — vendored, patched pyrender renders episodes headlessly
+  (rgb/seg/depth, 256x256); `render`/`crosscheck` CLI work; MuJoCo
+  cross-render oracle; benchmark. See "Rendering (V2)" above.
 - **V3** — MuJoCo episode generation; `generate` CLI produces GLB episodes.
 - **V4** — `RWM_state_series` extension: encode/decode + schema validation.
 - **V5** — KHR physics extension codec (rigid bodies + implicit shapes).

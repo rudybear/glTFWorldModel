@@ -147,3 +147,132 @@ so that any of these can be re-run by hand, not just by an agent.
   `inspect` prints each object (id/shape/category/mass/static), frame
   count, duration, which optional channels are present, and the
   `extensionsUsed` list; exits 0.
+
+## V2 — headless renderer: rgb + segmentation + depth
+
+Everything in this section needs the `render` extra
+(`gltfworld.render.renderer`, wrapping the vendored pyrender at
+`src/gltfworld/_vendor/pyrender/`; see `src/gltfworld/_vendor/PROVENANCE.md`
+for the pinned commit and patch list). The MuJoCo crosscheck also needs the
+`sim` extra. Install both:
+
+```bash
+uv sync --extra sim --extra render --dev
+```
+
+All of the checkpoints below except "EGL device info" and "CI stays green"
+need a real GPU with a working EGL offscreen context, so their tests are
+`@pytest.mark.gpu` and only run locally, never in CI (see "CI stays green"
+below).
+
+### Checkpoint: EGL device info
+
+- **Purpose**: confirm the renderer actually gets a hardware (NVIDIA) EGL
+  context, not a software/Mesa fallback, before trusting any performance or
+  correctness numbers from it.
+- **Command**:
+
+  ```bash
+  uv run python -c "
+  from gltfworld.render.renderer import egl_info
+  import json; print(json.dumps(egl_info(), indent=2))
+  "
+  ```
+
+- **Expected result**: exits 0; `gl_vendor` contains `"NVIDIA"` and
+  `gl_renderer` names the actual GPU (on a Mesa-only machine, `gl_vendor`
+  would instead say `"Mesa"` or similar -- that's the renderer.py module's
+  `__EGL_VENDOR_LIBRARY_FILENAMES` forcing not having an NVIDIA ICD to
+  force in the first place, not a bug in gltfworld). On this project's
+  development machine: `gl_vendor: "NVIDIA Corporation"`,
+  `gl_renderer: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition/PCIe/SSE2"`.
+
+### Checkpoint: analytic correctness (sphere/box/seg/determinism)
+
+- **Purpose**: confirm the renderer's geometry, depth, and segmentation are
+  *quantitatively* correct against closed-form expectations (not just
+  "looks plausible") -- projected sphere silhouette area, center-pixel
+  depth, box occlusion ordering, seg-value exactness, and bitwise
+  determinism across repeated renders of the same frame.
+- **Command**: `uv run pytest tests/test_render_analytic.py -v -m gpu`
+- **Expected result**: all 5 tests pass: sphere silhouette area within 3%
+  of the closed-form projected-disc area; sphere center-pixel depth within
+  1% of `d - r`; the nearer of two boxes occludes the farther one at the
+  center pixel with the farther box still visible (and correctly
+  identified) where it peeks out around the nearer box's silhouette; every
+  nonzero seg value is a real object_id from the episode; two renders of
+  the same frame are bitwise identical (rgb, seg, and depth's raw uint32
+  bit pattern).
+
+### Checkpoint: MuJoCo cross-render oracle (IoU)
+
+- **Purpose**: confirm gltfworld's renderer and an independent renderer
+  (MuJoCo) agree on scene *geometry* for the same episode -- an
+  independent check that doesn't share any code path with
+  `EpisodeRenderer`. Compares binary silhouettes (any-object vs
+  background) only, since MuJoCo's flat shading looks nothing like
+  pyrender's PBR output and lighting/color are out of scope here.
+- **Command**: `uv run pytest tests/test_crosscheck.py -v -m gpu -s`
+  (`-s` to see the printed IoU numbers), or via the CLI:
+  `uv run gltfworld crosscheck /tmp/sample_episode.glb`
+- **Expected result**: binary silhouette IoU >= 0.98 (measured on this
+  machine: **0.9962** for `tests/conftest.py:make_sample_episode()`'s frame
+  0, with per-object IoUs 0.9863 / 0.9989 / 1.0000 for the three falling
+  shapes). Also runs 3 fast, non-gpu unit tests for the
+  `gltf_pose_to_mujoco` Y-up-to-Z-up coordinate conversion (axis mapping,
+  quaternion order/normalization, proper-rotation/determinant check) --
+  those run under the default `-m "not gpu"` too. A side-by-side +
+  binary-mask-diff PNG is written to `/tmp/gltfworld_crosscheck/`.
+
+### Checkpoint: benchmark (rgb / rgb+depth / rgb+depth+seg fps)
+
+- **Purpose**: confirm the renderer is fast enough for real dataset
+  generation, with an honest breakdown if it isn't at the stretch target.
+- **Command**: `uv run pytest tests/test_render_bench.py -v -m gpu -s`
+- **Expected result**: passes (hard floor: rgb+depth+seg >= 100 fps);
+  prints fps for all three variants plus a draw-vs-readback breakdown.
+  Measured on this machine (persistent renderer, 4-object scene, 500
+  frames, 256x256): rgb-only 1003.1 fps, rgb+depth 1022.7 fps,
+  rgb+depth+seg **639.5 fps** (comfortably above both the 100 fps floor and
+  the 300 fps target). Note: (a) and (b) use the same underlying pyrender
+  call (`OffscreenRenderer.render()` always reads back color and depth
+  together unless `RenderFlags.DEPTH_ONLY` is set), so their near-equal fps
+  is an expected, reported finding, not a bug.
+
+### Checkpoint: `render`/`crosscheck` CLI demo
+
+- **Purpose**: confirm the CLI end-to-end, the way a human would use it.
+- **Command**:
+
+  ```bash
+  uv run python -c "
+  import sys; sys.path.insert(0, 'tests')
+  from conftest import make_sample_episode
+  from gltfworld.scene.convert import save_episode
+  save_episode(make_sample_episode(), '/tmp/sample_episode.glb')
+  "
+  uv run gltfworld render /tmp/sample_episode.glb --out /tmp/gltfworld_render_out --size 256
+  uv run gltfworld crosscheck /tmp/sample_episode.glb
+  ```
+
+- **Expected result**: `render` writes `rgb.npy` `(T,H,W,3)` uint8,
+  `seg.npy` `(T,H,W)` uint16, `depth.npy` `(T,H,W)` float16, and
+  `frame_000.png` into `/tmp/gltfworld_render_out/`; exits 0. `crosscheck`
+  prints the frame-0 binary silhouette IoU and per-object IoUs, writes a
+  side-by-side + diff PNG, and exits 0 if IoU >= 0.98 (1 otherwise).
+
+### Checkpoint: CI stays green with gpu tests excluded
+
+- **Purpose**: confirm gpu-marked tests (which need a real GPU/EGL context
+  CI runners don't have) are cleanly excluded in CI, while still being
+  *collected* (their modules import `gltfworld.render.renderer`/
+  `.crosscheck` at module scope, so the `render` extra must still resolve
+  in CI) so a broken import doesn't silently disappear behind the marker
+  filter.
+- **Command**: `.github/workflows/ci.yml`, job `test` (now
+  `uv sync --dev --extra render` then `uv run pytest -v -m "not gpu"`); or
+  locally: `uv run pytest -v -m "not gpu"`.
+- **Expected result**: green; 38 non-gpu tests pass, 7 gpu tests deselected
+  (not errored, not skipped-with-a-warning -- cleanly excluded by the
+  marker). Run the full suite (gpu tests included) locally with
+  `uv run pytest -v` -- both invocations must be green on a GPU machine.

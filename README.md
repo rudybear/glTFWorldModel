@@ -27,14 +27,17 @@ custom extensions are needed to fill in.
 
 ## Status
 
-V1 — glTF transport codec (pose animation + KHR physics + `RWM_state_series`)
-— see [docs/VERIFICATION.md](docs/VERIFICATION.md).
+V2 — headless renderer (rgb + segmentation + depth via vendored, patched
+pyrender; MuJoCo cross-render oracle; `render`/`crosscheck` CLI) on top of
+the V1 glTF transport codec (pose animation + KHR physics +
+`RWM_state_series`) — see [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Setup
 
 ```bash
 uv sync --all-extras
-uv run pytest
+uv run pytest -m "not gpu"   # CI-equivalent: no GPU/EGL required
+uv run pytest                # full suite, needs a GPU + working EGL offscreen context
 ```
 
 ## License

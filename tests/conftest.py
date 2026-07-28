@@ -138,6 +138,35 @@ def sample_episode() -> Episode:
     return make_sample_episode()
 
 
+@pytest.fixture(scope="session")
+def episode_renderer():
+    """One process-lifetime ``EpisodeRenderer``, shared by every gpu-marked
+    render test in the session.
+
+    This isn't just an optimization: pyrender's EGL platform binds to the
+    *shared default* EGL display (``get_default_device()`` ->
+    ``eglGetDisplay(EGL_DEFAULT_DISPLAY)``), and
+    ``OffscreenRenderer.delete()`` unconditionally calls ``eglTerminate()``
+    on it. Deleting *any* one ``EpisodeRenderer``/``OffscreenRenderer``
+    instance in a process invalidates that shared display for every other
+    still-open instance (confirmed empirically: a second renderer's next
+    ``render()`` call fails with ``EGL_NOT_INITIALIZED`` as soon as a first,
+    unrelated renderer is deleted) -- not something a small, targeted patch
+    can fix without global refcounting of the shared display, which is out
+    of scope for gltfworld's pyrender patch set (see
+    ``src/gltfworld/_vendor/PROVENANCE.md``). So: exactly one
+    ``EpisodeRenderer`` may be alive-and-in-use per process; every test that
+    needs one shares this fixture and calls ``.load(episode)`` fresh
+    (cheap -- it only rebuilds the scene graph, not the GL context).
+    """
+    pytest.importorskip("gltfworld.render.renderer")
+    from gltfworld.render.renderer import EpisodeRenderer
+
+    renderer = EpisodeRenderer(width=256, height=256)
+    yield renderer
+    renderer.delete()
+
+
 def _load_schema_registry(root: Path) -> Registry:
     resources = []
     for path in sorted(root.rglob("*.schema.json")):

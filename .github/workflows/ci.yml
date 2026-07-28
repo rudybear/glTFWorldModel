@@ -17,7 +17,11 @@ jobs:
         uses: astral-sh/setup-uv@v3
 
       - name: Install dependencies
-        run: uv sync --dev
+        # --extra render: gpu-marked render tests (deselected below) still
+        # get *collected* (their modules import gltfworld.render.renderer /
+        # .crosscheck at module scope), so PyOpenGL & friends must resolve
+        # even though no GPU/EGL context is ever created in CI.
+        run: uv sync --dev --extra render
 
       # tests/test_validator.py exercises gltfworld's own download/cache
       # logic (gltfworld.cli.ensure_validator_binary), which caches to
@@ -29,7 +33,11 @@ jobs:
           key: gltfworld-gltf-validator-${{ env.GLTF_VALIDATOR_VERSION }}-linux64
 
       - name: Run tests
-        run: uv run pytest -v
+        # gpu-marked tests (milestone V2 renderer: analytic/determinism/
+        # crosscheck/benchmark) need a real GPU + working EGL offscreen
+        # context, which CI runners don't have; they're run locally only
+        # (see docs/VERIFICATION.md V2 section).
+        run: uv run pytest -v -m "not gpu"
 
   gltf-validator:
     runs-on: ubuntu-latest

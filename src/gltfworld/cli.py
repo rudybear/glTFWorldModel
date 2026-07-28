@@ -1,8 +1,9 @@
 """Command-line entry point for gltfworld.
 
 ``validate`` and ``inspect`` are real as of milestone V1 (the glTF transport
-codec); ``render``/``generate``/``stats``/``crosscheck`` remain V0-style
-stubs until their milestones land.
+codec); ``render`` and ``crosscheck`` are real as of milestone V2 (the
+headless renderer); ``generate``/``stats`` remain V0-style stubs until their
+milestones land.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-_STUB_SUBCOMMANDS = ("render", "generate", "stats", "crosscheck")
+_STUB_SUBCOMMANDS = ("generate", "stats")
 
 GLTF_VALIDATOR_VERSION = "2.0.0-dev.3.10"
 _VALIDATOR_URL_TEMPLATE = (
@@ -127,6 +128,39 @@ def _cmd_inspect(path: str) -> int:
     return 0
 
 
+def _cmd_render(path: str, out: str, size: int) -> int:
+    # Imported lazily: the `render` extra (pyrender's runtime deps) isn't
+    # required just to run `validate`/`inspect`.
+    from gltfworld.render.renderer import render_episode
+
+    out_dir = render_episode(path, out, width=size, height=size)
+    print(f"gltfworld render: wrote rgb.npy, seg.npy, depth.npy, frame_000.png to {out_dir}")
+    return 0
+
+
+def _cmd_crosscheck(path: str, size: int, out: str | None) -> int:
+    from gltfworld.render.crosscheck import crosscheck_frame0, write_side_by_side_png
+    from gltfworld.render.renderer import EpisodeRenderer
+    from gltfworld.scene.convert import load_episode
+
+    episode = load_episode(path)
+    renderer = EpisodeRenderer(width=size, height=size)
+    try:
+        result = crosscheck_frame0(episode, renderer, width=size, height=size)
+    finally:
+        renderer.delete()
+
+    if out is None:
+        out = str(Path("/tmp") / "gltfworld_crosscheck" / f"{Path(path).stem}.png")
+    png_path = write_side_by_side_png(result, out)
+
+    print(f"frame 0 binary silhouette IoU: {result.iou:.4f}")
+    for object_id, iou in sorted(result.per_object_iou.items()):
+        print(f"  object_id={object_id} IoU: {iou:.4f}")
+    print(f"side-by-side + diff PNG: {png_path}")
+    return 0 if result.iou >= 0.98 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gltfworld")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -136,6 +170,20 @@ def main(argv: list[str] | None = None) -> int:
 
     inspect_parser = subparsers.add_parser("inspect", help="print a summary of an episode GLB/glTF file")
     inspect_parser.add_argument("path", help="path to a .glb or .gltf file")
+
+    render_parser = subparsers.add_parser("render", help="render an episode GLB to rgb/seg/depth .npy files")
+    render_parser.add_argument("path", help="path to a .glb episode file")
+    render_parser.add_argument("--out", required=True, help="output directory")
+    render_parser.add_argument("--size", type=int, default=256, help="square render size in pixels (default 256)")
+
+    crosscheck_parser = subparsers.add_parser(
+        "crosscheck", help="cross-render frame 0 against MuJoCo and report silhouette IoU"
+    )
+    crosscheck_parser.add_argument("path", help="path to a .glb episode file")
+    crosscheck_parser.add_argument("--size", type=int, default=256, help="square render size in pixels (default 256)")
+    crosscheck_parser.add_argument(
+        "--out", default=None, help="side-by-side PNG path (default: /tmp/gltfworld_crosscheck/<stem>.png)"
+    )
 
     for name in _STUB_SUBCOMMANDS:
         sub = subparsers.add_parser(name)
@@ -147,6 +195,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_validate(parsed.path)
     if parsed.command == "inspect":
         return _cmd_inspect(parsed.path)
+    if parsed.command == "render":
+        return _cmd_render(parsed.path, parsed.out, parsed.size)
+    if parsed.command == "crosscheck":
+        return _cmd_crosscheck(parsed.path, parsed.size, parsed.out)
 
     print(f"gltfworld {parsed.command}: not implemented yet (milestone V1+)")
     return 2
