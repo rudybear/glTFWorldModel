@@ -172,22 +172,22 @@ this run.
 
 ## 10. CI green on GitHub
 
-- [ ] **Purpose**: confirm the test suite passes in a clean environment,
+- [x] **Purpose**: confirm the test suite passes in a clean environment,
   not just this machine.
 - **Command**: `gh run list --limit 1`
 - **Expected result**: latest run's status `completed`/`success`.
-- **Observed**: **BLOCKED, not this milestone's regression.** Every CI run
-  since V0 (`gh run list --limit 5`, checked before this milestone touched
-  anything) was already failing: `import mujoco` transitively imports
-  `OpenGL.EGL`'s raw ctypes bindings at module load time, which raise
-  `AttributeError` (not `ImportError`, so mujoco's own guard and pytest's
-  `importorskip` both miss it) on a runner with no EGL/GL system libraries
-  at all -- true of plain `ubuntu-latest`. Root cause + fix applied
-  (`.github/workflows/ci.yml` now installs `libegl1 libgl1` and adds
-  `--extra ml` to the CI sync, the latter needed for this milestone's own
-  new torch/safetensors/scikit-image/torchmetrics-dependent tests) are
-  documented in `docs/VERIFICATION.md`'s V4 "Checkpoint: CI" section. Per
-  this milestone's explicit rule ("DO NOT PUSH"), the fix is committed
-  locally but not pushed, so `gh run list --limit 1` still reflects the
-  last *pushed* (pre-V4) commit's failing run at the time of writing. This
-  item stays unchecked until someone pushes and re-runs it.
+- **Observed**: **PASS** (verified post-push by the orchestrator,
+  2026-07-28). History: every CI run from V0 through V3.1 had been failing
+  for two stacked reasons, both found during V4: (1) `import mujoco`
+  transitively imports `OpenGL.EGL`'s raw ctypes bindings at module load
+  time, which raise `AttributeError` (not `ImportError`, so mujoco's own
+  guard and pytest's `importorskip` both miss it) on a runner with no
+  EGL/GL system libraries — fixed by installing `libegl1 libgl1` and
+  adding `--extra ml` to the CI sync (commit fff0715); (2) the V0-era
+  standalone `gltf-validator` job invoked the validator binary with an
+  unsupported `--version` flag (usage + exit 1 on every run) and was
+  redundant — real validation runs inside pytest via
+  `tests/test_validator.py` — so the job was removed (commit ce3e1a1).
+  After pushing both fixes: run 30333212629 on commit ce3e1a1 concluded
+  `success` (job `test`: success). Details in `docs/VERIFICATION.md` V4
+  "Checkpoint: CI".
