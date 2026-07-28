@@ -21,7 +21,13 @@ jobs:
         # get *collected* (their modules import gltfworld.render.renderer /
         # .crosscheck at module scope), so PyOpenGL & friends must resolve
         # even though no GPU/EGL context is ever created in CI.
-        run: uv sync --dev --extra render
+        # --extra sim: MuJoCo's core physics API (gltfworld.datagen.*) needs
+        # no GPU/EGL context at all -- only mujoco.Renderer (used by
+        # gltfworld.render.crosscheck, gpu-marked) does. So the V3 datagen
+        # tests (test_freefall.py, test_velocity_consistency.py,
+        # test_episode_pipeline.py) run for real in CI, not just via
+        # importorskip.
+        run: uv sync --dev --extra render --extra sim
 
       # tests/test_validator.py exercises gltfworld's own download/cache
       # logic (gltfworld.cli.ensure_validator_binary), which caches to

@@ -118,7 +118,12 @@ def make_sample_episode(n_objects: int = 3, T: int = 30) -> Episode:
 
     for i in range(1, n):
         h0 = start_heights[i - 1]
-        x = float(i)
+        # Centered, closely-spaced x offsets (not `float(i)`, which put the
+        # last object at x=3 -- outside the render camera's frustum at the
+        # crosscheck's 1:1 aspect, making its IoU vacuous; see DESIGN.md
+        # "wm-scenes-v1"/V3 report). All objects must land inside the
+        # frustum so every per-object IoU is a real, non-vacuous comparison.
+        x = (i - (n + 1) / 2.0) * 0.9
         for t in range(T):
             time = times[t]
             vy = gravity_y * time

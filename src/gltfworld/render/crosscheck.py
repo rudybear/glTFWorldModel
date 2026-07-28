@@ -24,73 +24,19 @@ import numpy as np
 if "MUJOCO_GL" not in os.environ:
     os.environ["MUJOCO_GL"] = "egl"
 
-from gltfworld.scene.episode import Episode
+from gltfworld.datagen.mj_convert import gltf_pose_to_mj as gltf_pose_to_mujoco  # noqa: E402
+from gltfworld.scene.episode import Episode  # noqa: E402
 
 # --- coordinate conversion ----------------------------------------------------
-
-# +90 degree rotation about the shared X axis, as an xyzw quaternion: this is
-# the fixed rotation that carries glTF's Y-up right-handed world frame onto
-# MuJoCo's Z-up right-handed world frame (see `gltf_pose_to_mujoco`).
-_AXIS_QUAT_XYZW = np.array(
-    [np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0)], dtype=np.float64
-)
-
-
-def _quat_mul_xyzw(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Hamilton product of two xyzw quaternions (q1 applied after q2, i.e.
-    the rotation ``q1 * q2`` means "first rotate by q2, then by q1")."""
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return np.array(
-        [
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        ]
-    )
-
-
-def gltf_pose_to_mujoco(
-    position: np.ndarray, quat_xyzw: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Convert one (position, orientation) pose from glTF convention to
-    MuJoCo convention.
-
-    glTF: Y-up, right-handed world; cameras look down local -Z with local
-    +Y up; quaternions are (x, y, z, w).
-    MuJoCo: Z-up, right-handed world; cameras *also* look down local -Z
-    with local +Y up (MuJoCo's camera convention already matches OpenGL/
-    glTF here -- no extra camera-specific handling needed); quaternions are
-    (w, x, y, z).
-
-    The two world frames are related by a single fixed +90 degree rotation
-    about the (shared) X axis: ``(x, y, z)_gltf -> (x, -z, y)_mujoco``. This
-    is a proper rotation (determinant +1, not a reflection) that carries
-    glTF's up axis (+Y) onto MuJoCo's up axis (+Z), so handedness/chirality
-    of any geometry is preserved -- only which axis is "up" changes.
-    Positions transform by that same linear map; orientations transform by
-    composing the fixed axis-change rotation with the original rotation
-    (``q_mujoco = q_axis_change * q_gltf``, applied in world space), since
-    an object's local axes must map into the *new* world frame the same
-    way the world frame itself was remapped.
-
-    Returns
-    -------
-    position_mj : (3,) float64, MuJoCo (x, y, z)
-    quat_wxyz_mj : (4,) float64, MuJoCo (w, x, y, z)
-    """
-    position = np.asarray(position, dtype=np.float64)
-    quat_xyzw = np.asarray(quat_xyzw, dtype=np.float64)
-
-    x, y, z = position
-    position_mj = np.array([x, -z, y], dtype=np.float64)
-
-    q_mj_xyzw = _quat_mul_xyzw(_AXIS_QUAT_XYZW, quat_xyzw)
-    quat_wxyz_mj = np.array(
-        [q_mj_xyzw[3], q_mj_xyzw[0], q_mj_xyzw[1], q_mj_xyzw[2]], dtype=np.float64
-    )
-    return position_mj, quat_wxyz_mj
+#
+# All MuJoCo<->contract conversion (position/quaternion/velocity) lives in
+# ``gltfworld.datagen.mj_convert`` -- this module re-exports
+# ``gltf_pose_to_mujoco`` (== ``mj_convert.gltf_pose_to_mj``) under its
+# original V2 name for backwards compatibility (this file's own tests and
+# call sites below still use that name). See ``mj_convert``'s module
+# docstring for the exact fixed change-of-basis matrix and the reasoning
+# behind composing (not conjugating) the axis-change rotation with an
+# object's own orientation.
 
 
 # --- MJCF construction ---------------------------------------------------------
@@ -215,14 +161,19 @@ class CrosscheckResult:
     mujoco_rgb: np.ndarray
     gltf_mask: np.ndarray
     mujoco_mask: np.ndarray
+    # Pixel-count union per object_id, alongside per_object_iou: lets callers
+    # assert a per-object IoU is a real comparison (union > 0), not the
+    # vacuous "both masks empty" 1.0 that _iou returns when union == 0 (see
+    # DESIGN.md/V3 report re: the V2 sample episode's out-of-frame cylinder).
+    per_object_union: dict[int, int]
 
 
-def _iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+def _iou(mask_a: np.ndarray, mask_b: np.ndarray) -> tuple[float, int]:
     intersection = np.count_nonzero(mask_a & mask_b)
     union = np.count_nonzero(mask_a | mask_b)
     if union == 0:
-        return 1.0
-    return intersection / union
+        return 1.0, 0
+    return intersection / union, int(union)
 
 
 def crosscheck_frame0(episode: Episode, episode_renderer, width: int = 256, height: int = 256) -> CrosscheckResult:
@@ -242,9 +193,10 @@ def crosscheck_frame0(episode: Episode, episode_renderer, width: int = 256, heig
     mj_frame = render_mujoco_frame0(episode, width=width, height=height)
     mj_mask = mj_frame.geom_id != -1
 
-    iou = _iou(gltf_mask, mj_mask)
+    iou, _ = _iou(gltf_mask, mj_mask)
 
     per_object_iou: dict[int, float] = {}
+    per_object_union: dict[int, int] = {}
     for obj in episode.scene.objects:
         if obj.object_id == 0:
             # gltfworld's seg encoding aliases object_id 0 with background
@@ -256,7 +208,9 @@ def crosscheck_frame0(episode: Episode, episode_renderer, width: int = 256, heig
             continue
         gltf_obj_mask = gltf_frame.seg == obj.object_id
         mj_obj_mask = np.isin(mj_frame.geom_id, geom_ids)
-        per_object_iou[obj.object_id] = _iou(gltf_obj_mask, mj_obj_mask)
+        obj_iou, obj_union = _iou(gltf_obj_mask, mj_obj_mask)
+        per_object_iou[obj.object_id] = obj_iou
+        per_object_union[obj.object_id] = obj_union
 
     return CrosscheckResult(
         iou=iou,
@@ -265,6 +219,7 @@ def crosscheck_frame0(episode: Episode, episode_renderer, width: int = 256, heig
         mujoco_rgb=mj_frame.rgb,
         gltf_mask=gltf_mask,
         mujoco_mask=mj_mask,
+        per_object_union=per_object_union,
     )
 
 

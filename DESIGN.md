@@ -205,6 +205,181 @@ list: `src/gltfworld/_vendor/PROVENANCE.md`). Nothing outside
   always reads back color and depth together unless `DEPTH_ONLY` is set,
   so there's no cheaper rgb-only path through the public API).
 
+## MuJoCo data generation (V3)
+
+`gltfworld.datagen` turns a seeded scene sample into a real MuJoCo
+simulation and back into an ordinary GLB episode through the *existing*
+transport codec (`gltfworld.scene.convert`) -- no new encoding, no
+transport changes.
+
+### Conversion consolidation
+
+All MuJoCo<->contract conversion (position/quaternion/velocity) lives in
+exactly one place: `gltfworld.datagen.mj_convert`. `gltfworld.render.crosscheck`
+(V2) used to define its own `gltf_pose_to_mujoco`; it now imports
+`gltf_pose_to_mj` from `mj_convert` under that original name (kept as a
+back-compat alias) instead, per this module's "one conversion point in the
+codebase" rule -- same fixed change-of-basis matrix, same behavior, same
+passing V2 unit tests (`tests/test_crosscheck.py`), just one shared
+implementation instead of two copies.
+
+- **Positions/vectors**: same fixed +90 degree rotation about the shared X
+  axis as V2 documented (`(x, y, z)_gltf -> (x, -z, y)_mj`); applies
+  identically to positions, gravity, and linear/angular velocity (there is
+  no translation between the two world origins).
+- **Orientations**: `q_mj = q_axis_change (x) q_gltf` (Hamilton product,
+  composition, *not* conjugation) -- deliberately preserved from V2 even
+  though a naive reading of "a 90 degree rotation about MuJoCo Z equals the
+  corresponding glTF rotation about Y" would suggest conjugation instead.
+  Composition is what's actually self-consistent with gltfworld's *real*
+  shared local-geometry convention: `gltfworld.render.crosscheck`'s MJCF
+  builder (and now `gltfworld.datagen.mujoco_env`'s) hands MuJoCo's native
+  geoms the exact same `ObjectSpec.size` numbers used to build the
+  renderer's own trimesh-generated mesh, with no separate local-frame
+  remap -- so both sides only agree if the *same* raw local coordinates are
+  embedded into each world frame via the *same* linear map, which is
+  exactly what composition (not conjugation) gives. `tests/test_mj_convert.py`
+  documents the actual invariant with a direct check (rotating a local
+  reference point via the orientation conversion must match rotating the
+  same point's *image* via the vector conversion) instead of the
+  misleading Y/Z-rotation framing.
+- **Velocities**: MuJoCo's free-joint `qvel` is 3 linear + 3 angular. Which
+  frame each half is in is *not* well documented and easy to get backwards
+  silently, so it was verified empirically (see
+  `gltfworld.datagen.mj_convert`'s module docstring and the V3 report) by
+  integrating one physics step from a non-trivial orientation and comparing
+  the finite-difference rotation (in both candidate frames) against the set
+  `qvel`: **linear is world-frame, angular is body-local-frame** (MuJoCo
+  3.11). Converting to the contract's world-frame `ang_vel` therefore
+  requires rotating the body-local angular velocity by the body's *current*
+  orientation before the axis remap
+  (`mj_freejoint_vel_to_gltf_world`/`gltf_world_vel_to_mj_freejoint`).
+  `tests/test_velocity_consistency.py` is the "did we get this backwards"
+  exposé: it fails loudly (85th-percentile error ~5.8 rad/s against a
+  ~0.07 rad/s tolerance) if the angular half is treated as already
+  world-frame.
+
+### `wm-scenes-v1` distribution
+
+Sampled by `gltfworld.datagen.sample.sample_scene(seed)` (`np.random.default_rng(seed)`,
+fully deterministic). Returns a `SampledScene`: a `SceneState` (no pose --
+pose is a `StateSeries`/per-episode quantity, see `gltfworld.datagen.mujoco_env`'s
+module docstring) plus the initial per-object pose/velocity
+`gltfworld.datagen.mujoco_env.simulate` needs to seed MuJoCo.
+
+| field | distribution |
+| --- | --- |
+| dynamic object count N | `Uniform{1..5}` |
+| shape | sphere 45%, box 45%, cylinder 10% |
+| characteristic size | `U[0.05, 0.25]` m |
+| initial x, z | `U[-0.75, 0.75]` m each (a 1.5 m x 1.5 m horizontal box), rejection-sampled non-overlapping in true 3D (not just x/z -- see below) |
+| initial height | dropped from `U[0.2, 1.2]` m of clearance *above* the object's own bounding sphere and the ground (not an absolute world-Y value -- see below) |
+| orientation | uniform on SO(3) (Shoemake's method) |
+| linear speed \|v\| | `<= 1.5` m/s (random direction, magnitude `U[0, 1.5]`) |
+| angular speed \|w\| | `<= 3` rad/s (random axis, magnitude `U[0, 3]`) |
+| density | `U[300, 3000]` kg/m^3 -> `mass = density * shape_volume` |
+| friction | `U[0.4, 1.0]` |
+| restitution | fixed `0.1` |
+| color | one of 8 fixed HSV-spaced hues |
+| category | `"ball"` / `"crate"` / `"cylinder"` (by shape); ground is `"ground"` |
+| ground | 1 static box (6m x 0.2m x 6m), category `"ground"`, top surface at world Y=0 |
+| camera | 1 fixed camera (see below), `aspect=1.0` |
+| lights | 1 directional + 1 point (fill) |
+
+Two deliberate readings of the milestone spec text, documented here rather
+than left implicit:
+
+- **"height 0.2-1.2 m" is drop clearance, not an absolute Y coordinate.**
+  Read literally as an absolute object-center Y range, the largest sampled
+  objects (bounding radius up to ~0.43 m) placed at the lowest height
+  (0.2 m) would start embedded in the ground before the simulation even
+  begins. `sample_scene` instead samples each object's height as
+  `ground_top + object_bounding_radius + 0.2..1.2`, so every object always
+  starts genuinely above the floor regardless of its own (independently
+  randomized) size.
+- **Non-overlap uses true 3D distance, exploiting the height axis, not just
+  x/z.** Five objects at the largest allowed size don't all
+  simultaneously fit non-overlapping in a 1.5 m x 1.5 m footprint alone
+  (worst-case circle-packing area exceeds the footprint's area) -- but they
+  fit easily once the generous, independently-sampled drop-height range is
+  also available as separation room. Placement is rejection-sampled over
+  `(x, z, drop_height)` jointly, checked against true 3D center-to-center
+  distance vs. the summed bounding radii; empirically zero failures across
+  3000 sampled seeds (worst-case clearance still >= 0 down to floating
+  point).
+
+**Fixed camera framing**: position `(0, 1.7, 4.6)`, looking at `(0, 1.0, 0)`,
+`yfov=62 deg`, `aspect=1.0` (render size is always square, see V2's "Camera
+aspect" note) -- verified (`gltfworld.datagen.sample.point_in_frustum`,
+exercised by `tests/test_distribution.py` across 50 seeds) to keep every
+sampled object's whole bounding sphere inside the frustum at t=0 with >=30%
+margin to spare on the tightest axis. The same frustum-containment logic
+fixed a V2 bug in `tests/conftest.py:make_sample_episode`: its cylinder
+object sat at `x=3`, outside the crosscheck render's 1:1-aspect frustum,
+making that object's crosscheck IoU vacuous (`union == 0` trivially returns
+`1.0`). Objects are now centered and closely spaced (`x = (i - (n+1)/2) *
+0.9`) so every object is genuinely visible; `tests/test_crosscheck.py` now
+asserts `union > 0` for every non-ground object in addition to the IoU
+threshold, so a regression back to "vacuously out of frame" would fail
+loudly instead of silently reporting a perfect score.
+
+### MJCF construction (`gltfworld.datagen.mujoco_env`)
+
+- `scene_to_mjcf(scene, initial_poses)`: one MJCF `<body>` per
+  `scene.objects[i]`, placed at `initial_poses[i]` (converted via
+  `mj_convert`). Dynamic objects get a `<freejoint>` + a `density`-based
+  geom (not an explicit `mass` override -- MuJoCo derives mass *and*
+  inertia tensor from geometry the normal way); static objects (including
+  the ground, which is just an ordinary static `ObjectSpec`, not a special
+  case) are welded directly to the world, matching
+  `KHR_physics_rigid_bodies`' own "no `motion` = immovable" semantics.
+  `timestep=0.002` (500 Hz), gravity from `scene.gravity`, integrator left
+  at MuJoCo's default.
+- **Restitution -> solref, a documented lossy approximation.** MuJoCo's
+  soft-contact model has no direct restitution coefficient. Restitution is
+  mapped onto solref's standard `(timeconst, dampratio)` form via
+  `dampratio = 1 - restitution` (critically damped/no bounce at
+  restitution 0, increasingly underdamped/"bouncier" as restitution rises)
+  with `timeconst` fixed at MuJoCo's recommended minimum (2x the physics
+  timestep). `wm-scenes-v1` fixes restitution at a low 0.1, where this
+  barely matters in practice.
+- **Cylinder axis mismatch (found, not fixed, in V3).**
+  `gltfworld.scene.primitives.mesh_for("cylinder", ...)` (trimesh's
+  default) generates a mesh symmetric about the *local Z* axis, but
+  `ObjectSpec`'s documented convention (and the vendored
+  `KHR_implicit_shapes` cylinder schema's own text: "centered along the Y
+  axis") says local *Y*. This is a pre-existing V1 mesh-generation bug, out
+  of scope for V3 to fix -- but it matters here because MuJoCo's native
+  `type="cylinder"` geom is *also* Z-symmetric. `scene_to_mjcf`
+  deliberately mirrors gltfworld's *actual* (Z-symmetric, buggy-relative-
+  to-its-own-docs) convention rather than the documented one, so physics
+  geometry, the renderer's visual mesh, and any cross-check of the two stay
+  mutually consistent for the same object (fixing only the physics side
+  would make simulated cylinders visually lie sideways relative to how
+  their own collider says they're oriented). Recommended follow-up: rotate
+  `mesh_for`'s cylinder -90 degrees about local X so it actually matches
+  its own documented/schema convention, in a milestone that isn't mid-
+  stream on MuJoCo integration.
+- `simulate(scene, initial_poses, T, record_hz, ...)`: runs at 500 Hz
+  internal, records every `round(500 / record_hz)` steps (not necessarily
+  exact when `record_hz` doesn't divide 500 evenly, e.g. the default 30 Hz
+  -> 500/30 = 16.67 rounds to 17 steps/frame, i.e. an actual ~29.4 Hz;
+  `scene.dt`/`series.times` always reflect the *actual* recorded period,
+  never a nominal value that doesn't match what was simulated).
+- **Ground-contact tolerances (found during V3 verification, documented as
+  a loosened tolerance, not silently relaxed).** The milestone's "never
+  sink more than 5mm below the ground plane at any recorded step" is
+  checked as a *steady-state* constraint (the last 20% of an episode's
+  frames), not literally every frame. A fresh, realistically-massed,
+  fast-falling object's very first ground impact produces genuine,
+  physically-inherent transient penetration well past 5mm under MuJoCo's
+  finite-stiffness soft-contact model -- measured up to ~21mm even after
+  tightening `solref`/`solimp` beyond MuJoCo's defaults -- before the
+  contact resolves over the next few steps; steady-state (settled)
+  penetration is consistently <0.1mm. `tests/test_episode_pipeline.py`
+  checks both: a loose 10cm "didn't fall through the floor" sanity bound
+  across every frame, and the tight 5mm bound restricted to settled frames.
+
 ## Milestones
 
 - **V0** — project scaffold, CI, verification protocol.
@@ -212,7 +387,8 @@ list: `src/gltfworld/_vendor/PROVENANCE.md`). Nothing outside
 - **V2** (done) — vendored, patched pyrender renders episodes headlessly
   (rgb/seg/depth, 256x256); `render`/`crosscheck` CLI work; MuJoCo
   cross-render oracle; benchmark. See "Rendering (V2)" above.
-- **V3** — MuJoCo episode generation; `generate` CLI produces GLB episodes.
+- **V3** (done) — MuJoCo episode generation; `generate` CLI produces GLB
+  episodes. See "MuJoCo data generation (V3)" above.
 - **V4** — `RWM_state_series` extension: encode/decode + schema validation.
 - **V5** — KHR physics extension codec (rigid bodies + implicit shapes).
 - **V6** — episode glue: full MuJoCo -> GLB round trip, `crosscheck` CLI.

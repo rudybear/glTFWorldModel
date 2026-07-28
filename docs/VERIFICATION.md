@@ -270,9 +270,146 @@ below).
   in CI) so a broken import doesn't silently disappear behind the marker
   filter.
 - **Command**: `.github/workflows/ci.yml`, job `test` (now
-  `uv sync --dev --extra render` then `uv run pytest -v -m "not gpu"`); or
-  locally: `uv run pytest -v -m "not gpu"`.
-- **Expected result**: green; 38 non-gpu tests pass, 7 gpu tests deselected
-  (not errored, not skipped-with-a-warning -- cleanly excluded by the
-  marker). Run the full suite (gpu tests included) locally with
-  `uv run pytest -v` -- both invocations must be green on a GPU machine.
+  `uv sync --dev --extra render --extra sim` then `uv run pytest -v -m "not gpu"`
+  -- `--extra sim` added in V3 so MuJoCo-backed datagen tests run for real
+  in CI, not just via `importorskip`: MuJoCo's core physics API needs no
+  GPU/EGL context, only `mujoco.Renderer` (gpu-marked) does); or locally:
+  `uv run pytest -v -m "not gpu"`.
+- **Expected result**: green. As of V2: 38 non-gpu tests pass, 7 gpu tests
+  deselected. As of V3 (this count grows with each milestone -- re-run the
+  command for the current number, don't treat this as pinned): 87 non-gpu
+  tests pass, 7 gpu tests deselected (not errored, not skipped-with-a-
+  warning -- cleanly excluded by the marker). Run the full suite (gpu tests
+  included) locally with `uv run pytest -v` (94 tests as of V3) -- both
+  invocations must be green on a GPU machine.
+
+## V3 — MuJoCo episode generation
+
+Needs the `sim` extra (`mujoco>=3.1`): `uv sync --extra sim --dev`. None of
+this milestone's own tests need a GPU/EGL context (MuJoCo's core physics
+API is CPU-only; only `mujoco.Renderer`, used by the V2 crosscheck, needs
+one) -- they all run under the default `-m "not gpu"`, including in CI
+(`.github/workflows/ci.yml` now installs `--extra sim` too).
+
+### Checkpoint: MuJoCo<->contract conversion (`mj_convert`)
+
+- **Purpose**: confirm the one, consolidated place all MuJoCo coordinate/
+  quaternion/velocity conversion lives (`gltfworld.datagen.mj_convert`) is
+  correct: known axis-mapping cases, round trips, batch-equals-scalar, and
+  the free-joint velocity frame convention (MuJoCo's `qvel` is 3 linear
+  world-frame + 3 angular *body-local*-frame -- verified empirically, see
+  DESIGN.md).
+- **Command**: `uv run pytest tests/test_mj_convert.py -v`
+- **Expected result**: all 16 tests pass. Pure numpy, no MuJoCo import, no
+  GPU.
+
+### Checkpoint: crosscheck consolidation didn't regress
+
+- **Purpose**: confirm refactoring `gltfworld.render.crosscheck` to import
+  its coordinate conversion from `mj_convert` (instead of defining its own)
+  kept its exact V2 behavior.
+- **Command**: `uv run pytest tests/test_crosscheck.py -v -m "not gpu"`
+  (non-gpu unit tests); `uv run pytest tests/test_crosscheck.py -v -m gpu -s`
+  (the real cross-render, needs GPU + MuJoCo).
+- **Expected result**: all pass. The gpu test additionally now asserts,
+  per non-ground object, `union > 0` (a real, non-vacuous comparison) and
+  `IoU >= 0.95`, on top of the overall `IoU >= 0.98` -- catching the V2
+  cylinder-out-of-frame bug for good (see DESIGN.md "wm-scenes-v1"
+  distribution). Measured on this machine: per-object IoU 0.9946 / 1.0000
+  / 0.9954, overall 0.9969.
+
+### Checkpoint: free fall matches closed-form physics
+
+- **Purpose**: confirm the MuJoCo simulation + `mj_convert` round trip
+  reproduce a textbook result for the simplest possible case (a sphere
+  dropped with zero initial velocity, never contacting anything in the
+  recorded window) before trusting anything more complex.
+- **Command**: `uv run pytest tests/test_freefall.py -v`
+- **Expected result**: all 3 tests pass: recorded position within 1% of
+  `h - 1/2 g t^2`, recorded `lin_vel` within 1% of `-g t`, no horizontal
+  drift or spin.
+
+### Checkpoint: velocity/frame-convention exposé
+
+- **Purpose**: confirm recorded `lin_vel`/`ang_vel` are self-consistent with
+  finite-differencing the recorded poses, for a real multi-object episode
+  with rotation and ground contacts -- the check that fails loudly if
+  MuJoCo's body-local vs. world-frame angular velocity convention was
+  mixed up.
+- **Command**: `uv run pytest tests/test_velocity_consistency.py -v`
+- **Expected result**: both tests pass (85th-percentile finite-difference
+  error < 2% of max speed; a handful of contact/bounce frames are expected
+  outliers past that, documented in the test). Confirmed this actually
+  catches the bug it's meant to: monkeypatching the angular-velocity
+  conversion to the naive (wrong, no-body-rotation) interpretation pushes
+  the 85th-percentile error to ~5.8 rad/s against a ~0.07 rad/s tolerance
+  -- a large, obvious failure, not a borderline one.
+
+### Checkpoint: `wm-scenes-v1` distribution
+
+- **Purpose**: confirm the seeded scene sampler is deterministic and every
+  sample honors its declared constraints (object count, size, mass/
+  density, friction, restitution, non-overlap, in-frustum camera framing).
+- **Command**: `uv run pytest tests/test_distribution.py -v`
+- **Expected result**: all 14 tests pass across 50 sampled seeds each
+  (same seed -> bit-identical scene; every object non-overlapping, sized/
+  massed/frictioned in range, fully inside the fixed camera's frustum at
+  t=0).
+
+### Checkpoint: end-to-end episode pipeline
+
+- **Purpose**: confirm `generate`d episodes are real, valid GLB files
+  through the *existing* transport (no new encoding): pass the independent
+  glTF-Validator with zero errors, round-trip through `load_episode`, carry
+  no NaN/Inf, and never fall through the ground plane.
+- **Command**: `uv run pytest tests/test_episode_pipeline.py -v`
+- **Expected result**: all 14 tests pass (3 generated episodes, each
+  checked against the real validator, round-tripped, and checked for
+  NaN/Inf and ground penetration -- see DESIGN.md's "Ground-contact
+  tolerances" note for why that last check is split into a loose
+  "didn't fall through the floor" (10cm, every frame) and a tight
+  steady-state (5mm, last 20% of frames) bound instead of one "5mm at any
+  frame" bound).
+
+### Checkpoint: `generate` CLI demo
+
+- **Purpose**: confirm the CLI end-to-end, the way a human would use it.
+- **Command**:
+
+  ```bash
+  uv run gltfworld generate --out /tmp/gltfworld_generate_demo --episodes 3 --seed 42 --steps 100 --hz 30
+  uv run gltfworld inspect /tmp/gltfworld_generate_demo/ep_000000.glb
+  uv run gltfworld validate /tmp/gltfworld_generate_demo/ep_000000.glb
+  cat /tmp/gltfworld_generate_demo/manifest.json
+  ```
+
+- **Expected result**: `generate` writes `ep_000000.glb`..`ep_000002.glb` +
+  `manifest.json` to the output directory and exits 0. `inspect` prints
+  each object (ground + N dynamic, with mass/shape/category), frame count/
+  duration, and the extensions used. `validate` exits 0 with `numErrors ==
+  0`. `manifest.json` records `dataset_version`, `scene_version`, the base
+  `seed`, each episode's own seed, `steps`, `record_hz`, and `git_describe`.
+
+### Checkpoint: MANUAL -- preview a generated episode in a real glTF viewer
+
+- **Purpose**: the strongest end-to-end confirmation there is -- an
+  independent, off-the-shelf glTF viewer (not gltfworld's own renderer)
+  loading a `generate`d episode and playing its animation, with no console
+  errors. This is a check a human needs to actually look at; it can't be
+  fully automated.
+- **Command** (generates `out/preview_episode.glb`, per this doc):
+
+  ```bash
+  uv run gltfworld generate --out out --episodes 1 --seed 7 --steps 90 --hz 30
+  cp out/ep_000000.glb out/preview_episode.glb
+  ```
+
+- **Expected result**: drag `out/preview_episode.glb` into
+  <https://gltf-viewer.donmccurdy.com> in a browser. You should see: a
+  handful (matching whatever N the seed 7 scene sampled -- check
+  `uv run gltfworld inspect out/preview_episode.glb`'s object list) of
+  spheres/boxes (and, at 10% odds, a cylinder) falling under gravity and
+  settling on a flat gray ground plane; the animation plays automatically
+  on load; no errors in the browser's developer console. `out/` is
+  git-ignored (see `.gitignore`), so this file is never committed -- it's
+  a one-off local artifact for this manual check.

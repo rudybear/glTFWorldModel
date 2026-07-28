@@ -64,7 +64,17 @@ def test_crosscheck_binary_silhouette_iou(episode_renderer, tmp_path):
 
     assert result.iou >= 0.98, f"binary silhouette IoU too low: {result.iou:.4f}"
 
-    for object_id, iou in result.per_object_iou.items():
-        assert iou >= 0.0  # sanity: always computed when present; printed for the report
-        print(f"object_id={object_id} per-object IoU={iou:.4f}")
+    # Every non-ground object in the (V3-reframed, see conftest.py) sample
+    # episode must be genuinely visible: a nonzero union (not the vacuous
+    # "both masks empty -> IoU 1.0" case an out-of-frame object would give)
+    # and a real, high per-object IoU -- this is what actually caught the
+    # V2 cylinder-at-x=3-outside-the-frustum bug.
+    non_ground_ids = {obj.object_id for obj in episode.scene.objects if obj.object_id != 0}
+    assert set(result.per_object_iou) == non_ground_ids, "every non-ground object should have a per-object IoU"
+
+    for object_id, iou in sorted(result.per_object_iou.items()):
+        union = result.per_object_union[object_id]
+        assert union > 0, f"object_id={object_id} has zero union -- it's out of frame (vacuous IoU)"
+        assert iou >= 0.95, f"object_id={object_id} per-object IoU too low: {iou:.4f}"
+        print(f"object_id={object_id} per-object IoU={iou:.4f} union={union}")
     print(f"binary silhouette IoU={result.iou:.4f}")

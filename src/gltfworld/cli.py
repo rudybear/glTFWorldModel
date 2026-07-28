@@ -2,8 +2,9 @@
 
 ``validate`` and ``inspect`` are real as of milestone V1 (the glTF transport
 codec); ``render`` and ``crosscheck`` are real as of milestone V2 (the
-headless renderer); ``generate``/``stats`` remain V0-style stubs until their
-milestones land.
+headless renderer); ``generate`` is real as of milestone V3 (MuJoCo
+data generation); ``stats`` remains a V0-style stub until its milestone
+lands.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-_STUB_SUBCOMMANDS = ("generate", "stats")
+_STUB_SUBCOMMANDS = ("stats",)
 
 GLTF_VALIDATOR_VERSION = "2.0.0-dev.3.10"
 _VALIDATOR_URL_TEMPLATE = (
@@ -161,6 +162,16 @@ def _cmd_crosscheck(path: str, size: int, out: str | None) -> int:
     return 0 if result.iou >= 0.98 else 1
 
 
+def _cmd_generate(out: str, episodes: int, seed: int, steps: int, hz: float, render: bool, size: int) -> int:
+    # Imported lazily: the `sim` extra (mujoco) isn't required just to run
+    # validate/inspect/render/crosscheck.
+    from gltfworld.datagen.generate import generate_dataset
+
+    result = generate_dataset(out, episodes, seed, steps=steps, hz=hz, render=render, size=size)
+    print(f"gltfworld generate: wrote {len(result.episode_paths)} episode(s) + manifest to {result.out_dir}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gltfworld")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -185,6 +196,21 @@ def main(argv: list[str] | None = None) -> int:
         "--out", default=None, help="side-by-side PNG path (default: /tmp/gltfworld_crosscheck/<stem>.png)"
     )
 
+    generate_parser = subparsers.add_parser(
+        "generate", help="sample wm-scenes-v1 scenes, simulate in MuJoCo, write GLB episodes + manifest"
+    )
+    generate_parser.add_argument("--out", required=True, help="output directory")
+    generate_parser.add_argument("--episodes", type=int, required=True, help="number of episodes to generate")
+    generate_parser.add_argument("--seed", type=int, required=True, help="base seed (episode i uses seed + i)")
+    generate_parser.add_argument("--steps", type=int, default=100, help="recorded frames per episode (default 100)")
+    generate_parser.add_argument("--hz", type=float, default=30.0, help="recording rate in Hz (default 30)")
+    generate_parser.add_argument(
+        "--render", action="store_true", help="also render each episode's frames (needs the render extra + GPU)"
+    )
+    generate_parser.add_argument(
+        "--size", type=int, default=256, help="square render size in pixels when --render is passed (default 256)"
+    )
+
     for name in _STUB_SUBCOMMANDS:
         sub = subparsers.add_parser(name)
         sub.add_argument("args", nargs=argparse.REMAINDER)
@@ -199,6 +225,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_render(parsed.path, parsed.out, parsed.size)
     if parsed.command == "crosscheck":
         return _cmd_crosscheck(parsed.path, parsed.size, parsed.out)
+    if parsed.command == "generate":
+        return _cmd_generate(
+            parsed.out, parsed.episodes, parsed.seed, parsed.steps, parsed.hz, parsed.render, parsed.size
+        )
 
     print(f"gltfworld {parsed.command}: not implemented yet (milestone V1+)")
     return 2

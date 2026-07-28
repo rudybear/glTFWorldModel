@@ -235,8 +235,11 @@ def test_golden_episode_roundtrip(tmp_path):
 
     # A couple of fixed expected values pin down the deterministic kinematics
     # (regression guard against accidental changes to make_sample_episode).
+    # x=-1.35 reflects the V3 reframe (centered, closely-spaced x offsets so
+    # every object lands inside the crosscheck camera's frustum -- see
+    # conftest.py and tests/test_crosscheck.py); it was `1.0` pre-V3.
     assert episode.series.num_frames == 30
     assert len(episode.scene.objects) == 4  # ground + 3
-    np.testing.assert_allclose(episode.series.poses[0, 1, 0:3], [1.0, 2.0, 0.0])
+    np.testing.assert_allclose(episode.series.poses[0, 1, 0:3], [-1.35, 2.0, 0.0])
     assert episode.scene.objects[0].category == "ground"
     assert episode.scene.objects[0].is_static is True
