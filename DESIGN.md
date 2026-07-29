@@ -976,3 +976,197 @@ scope boundary, the full 25k-step training run is the orchestrator's to run
 reported honestly and recorded in `docs/RESULTS.md` rather than hidden --
 same policy `docs/VERIFICATION.md`'s V5 section already established for the
 dynamics model.
+
+### V6.1 postmortem: flat val `matched_pos_err` (dataset far too small)
+
+The orchestrator's full 25k-step run against the `perception-v1` dataset
+produced a pathological result: train loss fell smoothly to ~0.19-0.21, but
+val loss climbed monotonically from 2.18 (step 1000) to 8.87 (step 25000),
+and val `matched_pos_err` sat completely flat at ~0.6-0.67m (mean-predictor
+level for the ~1.5m workspace) from step 1000 through step 25000 -- it never
+improved even once. `--smoke` (500 steps, train-loss-only) passed cleanly at
+33% EMA drop, because it never looked at val at all.
+
+**Root-cause experiment** (the deciding one, not a guess): the exact val
+evaluation code path (`compute_perception_losses` + Hungarian matching) was
+run on 500 held-out *train* frames from the step-25000 checkpoint, and
+separately on 500 real val frames, both through the identical code:
+
+| split (through the val eval code path) | median matched_pos_err |
+| --- | --- |
+| train frames | 0.12 m |
+| val frames | 0.61 m |
+
+Train frames scored well *through the exact same pipeline* real val frames
+scored badly through -- ruling out a matching/eval-pipeline bug (option (c)
+in the investigation) and a train/val frame<->state misalignment bug
+(option (b)): the code is correct, and the model has clearly learned
+*something*, just nothing that transfers past the frames it was trained on.
+That is memorization, not a pipeline defect (per the investigation's own
+decision rule).
+
+**Why**: `perception-v1` had only 500 total episodes (458 train, 45,800
+rendered train frames) -- a placeholder/dev-scale count, an order of
+magnitude below `dynamics-v1`'s 10,000 episodes used for the (successfully
+generalizing) dynamics model. At `batch_size=128` and `steps=25,000`, the
+run drew 3,200,000 samples against those 45,800 train frames -- an
+"epoch-equivalent" of ~69.9x. `PerceptionDETR`'s ~8.2M parameters, over a
+visually low-dimensional task (fixed camera, 3 shapes, 8 colors, a small
+continuous workspace), memorized the 458 distinct training scenes well
+before step 1000 and never had a chance to learn a generalizable
+image->geometry mapping instead.
+
+**Refinement (V6.2 diagnostic, see below): the memorization finding above is
+not uniform across output heads.** Re-examining the same held-out-train-vs-
+val checkpoint: shape/class classification actually *did* generalize
+reasonably well (0.875 accuracy vs a 0.40 trivial-baseline accuracy) --
+it is specifically the position/existence heads that memorized without
+generalizing. A visually low-dimensional, near-discrete task (3 shapes, 3
+classes) is easier to generalize on from few examples than a continuous
+regression target over a large-ish task-relevant workspace; this dataset
+was too small for the latter, not for the former.
+
+**Fix**:
+
+1. Regenerated `perception-v1` at production scale (4,000 episodes,
+   `gltfworld generate --render --episodes 4000` at the same base seed, so
+   the original 500 episodes are a strict prefix) and re-packed it -- more
+   scene diversity to train against. (See the V6.2 follow-up below: the
+   originally-claimed "short confirmation run shows real, monotonic val
+   `matched_pos_err` improvement" was not actually observed and has been
+   retracted -- the dataset regeneration was necessary but a short
+   confirmation run at V6.1's chosen step count was not sufficient to
+   demonstrate it worked.)
+2. Added a dataset-scale guard to the training harness itself
+   (`gltfworld.train.train_perception.check_dataset_scale`/
+   `epoch_equivalent`/`MAX_EPOCH_EQUIVALENT=15.0`): `train()` now refuses to
+   start (a loud, immediate `ValueError`, not a silently-wasted 25k-step
+   run) whenever the configured step budget implies training on each train
+   frame more than 15x over, unless the config explicitly opts in via
+   `allow_high_epoch_equivalent=True` (e.g. a deliberately tiny smoke/
+   unit-test dataset). Run against the V6 incident's exact numbers
+   (25,000 steps, batch 128, 45,800 train frames -> 69.9x), this raises
+   immediately; against the regenerated 4,000-episode dataset it does not
+   (~8.9x for the same full schedule). This guard's own logic/cap is
+   unaffected by the V6.2 follow-up below and remains correct as designed.
+3. Added `--smoke-val`, since recalibrated in V6.2 (see below) to ~5,000
+   steps: asserts val `matched_pos_err` both improves from its step-500
+   value by a minimum relative amount and drops below an absolute bound --
+   unlike `--smoke`, this would have caught the V6 pathology directly (a
+   flat-at-the-mean-predictor val curve fails both conditions) rather than
+   needing the full 25k-step run and a human reading the log to notice.
+4. Regression tests: `tests/test_train_perception_dataset_scale.py` (no
+   GPU/data needed -- pure arithmetic against the exact V6 incident numbers)
+   and `tests/test_train_perception_smoke.py::test_smoke_val_on_real_
+   perception_v1` (gpu-marked, runs `--smoke-val` end-to-end against the
+   real, regenerated dataset).
+
+### V6.2 postmortem: correcting V6.1's unsupported claim, under-training vs. stagnation, and an out-of-box GT defect
+
+A follow-up diagnostic against the regenerated (4,000-episode) dataset
+produced hard evidence that requires correcting one of V6.1's claims above,
+and surfaced an independent, previously-unquantified data defect.
+
+**Correction to V6.1's "Fix" item 1**: the claim that a "~2500-step
+confirmation run shows real, monotonic val `matched_pos_err` improvement"
+is **not supported by the evidence** and is retracted. Two independent
+~1800-step confirmation runs against the regenerated dataset both showed a
+flat val `matched_pos_err` curve -- not the monotonic improvement V6.1
+reported. Whatever run originally produced that impression either
+mismeasured or was not reproduced; treat it as never having been
+demonstrated.
+
+**Why the flat curve is under-training, not a stuck/broken pathway** -- two
+independent pieces of evidence:
+
+1. **The position pathway itself is healthy.** An 8-frame overfit test
+   converges to a 0.05-0.09 m median `matched_pos_err`, and position
+   receives 32% of the trunk's gradient norm during training -- a model
+   that could not learn position at all, or whose gradient was being
+   drowned out by other loss terms, would not show either of these.
+2. **Epoch-equivalent math accounts for the flatness.** 1,800 steps @
+   `batch_size=128` on the 4,000-episode pack's 363,600 train frames is
+   `epoch_equivalent(1800, 128, 363_600) = 0.63` -- well under one full
+   pass over the training data. The *old*, 500-episode (memorizing)
+   dataset didn't show any val loss movement until roughly 3-8
+   epoch-equivalents in (see the V6.1 root-cause section above: train loss
+   was already memorizing well before step 1000 out of a 25,000-step/69.9x
+   run, i.e. movement was visible well under 1 epoch-equivalent there only
+   because the *train* set was catastrophically small and thus trivial to
+   fit -- not evidence that a *properly-sized* dataset should show val
+   movement that early too). A calibrated confirmation run on the
+   regenerated dataset needs roughly 15,000-25,000 steps (~5.3-8.8
+   epoch-equivalents) to be a fair test of whether the dataset fix worked.
+
+**`--smoke-val` recalibration**: V6.1's original ~1800-step/0.63-epoch-
+equivalent window was too short to distinguish "the dataset fix didn't
+work" from "hasn't trained long enough yet" -- exactly the ambiguity the
+two flat-curve runs above ran into. `--smoke-val` is recalibrated to
+~5,000 steps (~1.8 epoch-equivalents on the 4,000-episode pack -- still far
+short of the 15k-25k needed for a real confirmation, but enough to show an
+early, partial trend without paying for a full run) with a two-part
+acceptance bar
+(`gltfworld.train.train_perception.SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT=0.15`/
+`SMOKE_VAL_POS_ERR_BOUND_M=0.55`): val `matched_pos_err` at the final step
+must be both >= 15% relatively better than its value at step 500 *and*
+below 0.55m in absolute terms -- neither condition alone is a reliable
+generalization signal (a flat curve at a low absolute value would pass an
+absolute-only bar; an "improvement" from a catastrophic baseline to a
+still-bad value would pass a relative-only bar). See
+`gltfworld.train.train_perception`'s module docstring for the full
+rationale.
+
+**Observed result of running the recalibrated `--smoke-val` (this session,
+`configs/perception_v1.json`, seed 0) -- reported honestly, not tuned to
+pass**: val `matched_pos_err` per evaluation (steps 500-5000, every 500
+steps): 0.6458, 0.6606, 0.6426, 0.6589, 0.6309, 0.6228, 0.6156, 0.6182,
+0.6285, 0.5958 (m). Step-500 -> step-5000 relative improvement: **7.7%**
+(needs >= 15%); final value **0.5958m** (needs < 0.55m). **`--smoke-val`
+FAILED both of its own acceptance conditions.** This was not treated as a
+reason to loosen the bar -- it is fully consistent with, not a
+contradiction of, the epoch-equivalent analysis above: 5,000 steps is only
+~1.8 epoch-equivalents, well short of the ~15,000-25,000 steps (~5.3-8.8
+epoch-equivalents) estimated as necessary for a fair confirmation. The
+per-evaluation trend is real but slow and noisy (a mostly-flat plateau
+around 0.62-0.66m for the first ~4,000 steps, with the clearest single drop
+only in the last evaluation) -- exactly the shape expected of a
+still-under-training run this early in a 25k-step schedule, not evidence
+that the dataset-scale/out-of-box-GT fixes above didn't work. The
+orchestrator should not conclude either recovery or continued failure from
+this result alone: a full 15,000-25,000-step run (out of this milestone's
+scope -- see the Acceptance section above and DESIGN.md's "Do NOT launch
+the full retrain" scope boundary) is still the only way to actually confirm
+whether the V6.1/V6.2 fixes produce a generalizing model. The orchestrator
+has since launched that full run (`runs/perception-v2`); `--smoke-val`'s
+thresholds will be recalibrated from its measured curve once it completes,
+not tuned retroactively to make this session's short run pass.
+
+**Full 25k-step run outcome (orchestrator-run, `runs/perception-v2`)**: val
+`matched_pos_err` declined steadily from 0.658m to 0.461m with no plateau
+-- confirming the dataset-scale/out-of-box-GT fixes did restore real
+generalization -- though a train/val loss gap persists (0.61 train vs 2.34
+val), which `--smoke-val`'s pending recalibration (above) should account
+for rather than ignore.
+
+**Out-of-box GT defect (independent of the above)**: 4.51%/4.85%/3.60% of
+train/val/test GT object positions in the regenerated 4,000-episode pack
+fall outside the model's representable `[POS_MIN, POS_MAX]` workspace box
+(`gltfworld.models.perception`) -- objects that escape `wm-scenes-v1`'s
+finite ground plate over the course of an episode (observed extremes:
+y=-30.4m, z=+17.4m). These are simultaneously unobservable (outside the
+fixed camera's frustum -- never actually visible in the rendered RGB frame)
+and unrepresentable (the position head's sigmoid-into-box parameterization
+makes it structurally impossible for any query to emit a position out
+there), so every code path that treated them as "exists, supervise its
+pose" before this fix was poisoning both training and eval with an
+impossible-to-hit target. Fixed via `gltfworld.models.matching
+.filter_out_of_box_gt`, a single shared helper used by both the training
+loss (`compute_perception_losses`) and eval matching
+(`gltfworld.eval.perception_eval.run_inference`/`run_inference_baseline`):
+an out-of-box GT object's `mask` entry is cleared before Hungarian
+matching, so it is treated as *absent* for that frame -- no query can ever
+be matched to it, and existence supervision/eval skips it too, not just
+pose supervision. `gltfworld.data.pack.pack_dataset` also reports the
+per-split fraction (printed, and recorded in `pack_meta.json`'s
+`workspace_filter` field) so the defect's scale stays visible independent
+of any particular training/eval run.

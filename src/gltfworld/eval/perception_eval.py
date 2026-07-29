@@ -73,7 +73,14 @@ from torch.utils.data import DataLoader
 
 from gltfworld.data.dataset import PerceptionDataset
 from gltfworld.eval.metrics import psnr, ssim
-from gltfworld.models.matching import SPHERE_IDX, MatchCostWeights, hungarian_match, symmetry_rotation_angle
+from gltfworld.models.matching import (
+    SPHERE_IDX,
+    MatchCostWeights,
+    WorkspaceFilterStats,
+    filter_out_of_box_gt,
+    hungarian_match,
+    symmetry_rotation_angle,
+)
 from gltfworld.models.perception import PerceptionDETR, count_params
 from gltfworld.scene.contract import CATEGORY_TO_CLASS_ID, SHAPE_ORDER
 from gltfworld.scene.convert import load_episode, save_episode
@@ -154,10 +161,19 @@ class FrameRecord:
 
 
 @torch.no_grad()
-def run_inference(model: torch.nn.Module, ds: PerceptionDataset, device: torch.device, batch_size: int = 64) -> list[FrameRecord]:
+def run_inference(
+    model: torch.nn.Module, ds: PerceptionDataset, device: torch.device, batch_size: int = 64
+) -> tuple[list[FrameRecord], WorkspaceFilterStats]:
+    """Returns ``(records, workspace_stats)`` -- ``workspace_stats`` is the
+    accumulated (see :func:`filter_out_of_box_gt`) fraction of GT objects
+    that fell outside the representable workspace box and were therefore
+    excluded from matching/existence eval across this whole split (a V6.2
+    data-defect fix -- see DESIGN.md's V6.2 postmortem)."""
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     records: list[FrameRecord] = []
     row = 0
+    n_eligible_total = 0
+    n_out_of_box_total = 0
 
     for rgb, states, mask, class_ids in loader:
         rgb_d, states_d, mask_d, class_ids_d = rgb.to(device), states.to(device), mask.to(device), class_ids.to(device)
@@ -168,6 +184,10 @@ def run_inference(model: torch.nn.Module, ds: PerceptionDataset, device: torch.d
         gt_shape_idx = states_d[..., 13:16].argmax(dim=-1)
         gt_size = states_d[..., 16:19]
 
+        mask_d, batch_stats = filter_out_of_box_gt(gt_position, mask_d)
+        n_eligible_total += batch_stats.n_eligible
+        n_out_of_box_total += batch_stats.n_out_of_box
+
         matches = hungarian_match(
             pred["position"], pred["class_logits"], pred["size"], gt_position, class_ids_d, gt_size, mask_d,
             MatchCostWeights(),
@@ -175,6 +195,7 @@ def run_inference(model: torch.nn.Module, ds: PerceptionDataset, device: torch.d
         pred_shape_idx = pred["shape_logits"].argmax(dim=-1)
         pred_class_idx = pred["class_logits"].argmax(dim=-1)
 
+        mask_filtered_cpu = mask_d.cpu()
         b = rgb.shape[0]
         for i in range(b):
             episode_idx, frame_idx = ds._index[row]
@@ -184,7 +205,7 @@ def run_inference(model: torch.nn.Module, ds: PerceptionDataset, device: torch.d
                 FrameRecord(
                     episode_idx=episode_idx,
                     frame_idx=frame_idx,
-                    n_real=int(mask[i].sum()),
+                    n_real=int(mask_filtered_cpu[i].sum()),
                     query_idx=query_idx,
                     gt_idx=gt_idx,
                     existence_prob=existence_prob[i].cpu().numpy(),
@@ -200,7 +221,8 @@ def run_inference(model: torch.nn.Module, ds: PerceptionDataset, device: torch.d
                     gt_class_idx=class_ids[i].numpy(),
                 )
             )
-    return records
+    workspace_stats = WorkspaceFilterStats(n_eligible=n_eligible_total, n_out_of_box=n_out_of_box_total)
+    return records, workspace_stats
 
 
 # --- metrics -------------------------------------------------------------------
@@ -402,10 +424,18 @@ def mean_state_baseline_predict(baseline: dict, batch_size: int, n_queries: int)
 
 
 @torch.no_grad()
-def run_inference_baseline(baseline: dict, ds: PerceptionDataset, n_queries: int, batch_size: int = 64) -> list[FrameRecord]:
+def run_inference_baseline(
+    baseline: dict, ds: PerceptionDataset, n_queries: int, batch_size: int = 64
+) -> tuple[list[FrameRecord], WorkspaceFilterStats]:
+    """Returns ``(records, workspace_stats)`` -- same out-of-box GT filtering
+    as :func:`run_inference` (see its docstring), applied identically so the
+    baseline is never scored against a GT set the trained model's own eval
+    doesn't also see."""
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     records: list[FrameRecord] = []
     row = 0
+    n_eligible_total = 0
+    n_out_of_box_total = 0
 
     for rgb, states, mask, class_ids in loader:
         b = rgb.shape[0]
@@ -415,6 +445,10 @@ def run_inference_baseline(baseline: dict, ds: PerceptionDataset, n_queries: int
         gt_quat = states[..., 3:7]
         gt_shape_idx = states[..., 13:16].argmax(dim=-1)
         gt_size = states[..., 16:19]
+
+        mask, batch_stats = filter_out_of_box_gt(gt_position, mask)
+        n_eligible_total += batch_stats.n_eligible
+        n_out_of_box_total += batch_stats.n_out_of_box
 
         matches = hungarian_match(
             pred["position"], pred["class_logits"], pred["size"], gt_position, class_ids, gt_size, mask,
@@ -447,7 +481,8 @@ def run_inference_baseline(baseline: dict, ds: PerceptionDataset, n_queries: int
                     gt_class_idx=class_ids[i].numpy(),
                 )
             )
-    return records
+    workspace_stats = WorkspaceFilterStats(n_eligible=n_eligible_total, n_out_of_box=n_out_of_box_total)
+    return records, workspace_stats
 
 
 # --- markdown formatting --------------------------------------------------------
@@ -747,12 +782,26 @@ def main(argv: list[str] | None = None) -> int:
     n_params = count_params(model)
     print(f"model params={n_params:,}")
 
-    model_records = run_inference(model, ds, device, batch_size=args.batch_size)
+    model_records, workspace_stats = run_inference(model, ds, device, batch_size=args.batch_size)
     model_metrics = compute_metrics(model_records, name="PerceptionDETR")
+    print(
+        f"workspace filter (split={args.split!r}): {workspace_stats.n_out_of_box}/{workspace_stats.n_eligible} "
+        f"eligible GT objects ({workspace_stats.fraction_out_of_box * 100:.2f}%) fell outside the representable "
+        "[POS_MIN, POS_MAX] box and were excluded from matching/eval (see DESIGN.md's V6.2 postmortem)"
+    )
 
     baseline_stats = build_mean_state_baseline(train_ds)
-    baseline_records = run_inference_baseline(baseline_stats, ds, n_queries=model.n_queries, batch_size=args.batch_size)
+    baseline_records, baseline_workspace_stats = run_inference_baseline(
+        baseline_stats, ds, n_queries=model.n_queries, batch_size=args.batch_size
+    )
     baseline_metrics = compute_metrics(baseline_records, name="mean-state baseline")
+    # Same (ds, mask) pair the model's own eval saw, so this must agree exactly --
+    # a mismatch would mean the two inference passes disagree about which GT
+    # objects exist for this split, which should be structurally impossible.
+    assert baseline_workspace_stats == workspace_stats, (
+        f"baseline eval's workspace filter stats {baseline_workspace_stats} != model eval's {workspace_stats} "
+        "for the same split -- the two inference passes must see identical GT masks"
+    )
 
     all_metrics = {"PerceptionDETR": model_metrics, "mean-state baseline": baseline_metrics}
 
@@ -760,6 +809,11 @@ def main(argv: list[str] | None = None) -> int:
         "split": args.split,
         "n_frames": len(ds),
         "n_params": n_params,
+        "workspace_filter": {
+            "n_eligible": workspace_stats.n_eligible,
+            "n_out_of_box": workspace_stats.n_out_of_box,
+            "fraction_out_of_box": workspace_stats.fraction_out_of_box,
+        },
         "baseline_stats": {
             "mean_count": baseline_stats["mean_count"],
             "mean_position": baseline_stats["mean_position"].tolist(),

@@ -5,6 +5,38 @@ resumable checkpoints, ``--smoke``, ``log.csv``, safetensors checkpoints) but
 is otherwise a much simpler single-phase schedule -- there is no analogue of
 the dynamics model's autoregressive rollout finetune phase here.
 
+Two fast correctness checks, not one: ``--smoke`` (500 steps, train-loss-only)
+and ``--smoke-val`` (~5,000 steps, asserts val ``matched_pos_err`` actually
+improves). ``--smoke`` alone is *not* sufficient to catch every pathology --
+see :data:`MAX_EPOCH_EQUIVALENT`'s module comment below for the V6 incident
+this shipped in response to (train loss fell smoothly for the full 25k-step
+run while val ``matched_pos_err`` sat flat at the mean-predictor floor the
+entire time, because the dataset was far too small for the step budget and
+the model simply memorized it -- ``--smoke`` never looked at val at all, so
+it happily passed on step 1 of that run).
+
+**V6.2 recalibration of ``--smoke-val``** (see DESIGN.md's V6.2 postmortem):
+the original ~1800-step window (V6.1) was itself too short to tell "the
+dataset fix didn't work" apart from "the model just hasn't trained long
+enough yet" -- two independent 1800-step confirmation runs against the
+regenerated 4,000-episode dataset both showed a *flat* val
+``matched_pos_err`` curve, while a separate diagnostic (an 8-frame overfit
+test) confirmed the position pathway itself is healthy (converges to
+0.05-0.09m, receives 32% of the trunk's gradient norm) -- i.e. the flatness
+was under-training, not a stuck/broken pathway. 1800 steps @
+``batch_size=128`` against the 4,000-episode pack's 363,600 train frames is
+only a 0.63 "epoch-equivalent" (:func:`epoch_equivalent`) -- the *old*
+(memorizing) 500-episode dataset didn't show loss movement until ~3-8
+epoch-equivalents in, so 0.63x was never going to be enough to demonstrate
+real learning either way. ``--smoke-val`` is recalibrated to ~5,000 steps
+(~1.8 epoch-equivalents on the 4,000-episode pack) with a two-part
+acceptance bar (see :data:`SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT`/
+:data:`SMOKE_VAL_POS_ERR_BOUND_M`) that requires *both* a real relative
+improvement from the step-500 baseline *and* an absolute floor -- neither
+condition alone is enough (a flat curve at a low absolute value would pass
+an absolute-only bar; a relative improvement from a terrible baseline would
+pass a relative-only bar).
+
 Schedule
 --------
 
@@ -32,9 +64,21 @@ CLI
     uv run python -m gltfworld.train.train_perception \\
         --config configs/perception_v1.json --out runs/perception-v1 --resume
 
-    # fast correctness check (500 steps, tiny val, asserts >=30% loss drop):
+    # fast correctness check (500 steps, tiny val, asserts >=30% train loss drop):
     uv run python -m gltfworld.train.train_perception \\
         --config configs/perception_v1.json --out runs/perception-v1-smoke --smoke
+
+    # fast *generalization* check (~5,000 steps, ~1.8 epoch-equivalents on the
+    # 4,000-episode pack, ~20-30 min on GPU): asserts val matched_pos_err both
+    # improves >= SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT from its step-500 value
+    # and drops below SMOKE_VAL_POS_ERR_BOUND_M -- catches the V6 pathology
+    # (train loss falls, val matched_pos_err never moves off the
+    # mean-predictor floor) that --smoke's train-loss-only criterion missed
+    # entirely, at a window long enough to actually distinguish "still
+    # under-training" from "genuinely stuck" (see the module docstring's
+    # V6.2 recalibration note):
+    uv run python -m gltfworld.train.train_perception \\
+        --config configs/perception_v1.json --out runs/perception-v1-smoke-val --smoke-val
 
 Artifacts written to ``--out``: ``config.json``, ``log.csv`` (``step, split,
 lr, loss_total, loss_existence, loss_position, loss_size, loss_shape,
@@ -122,6 +166,11 @@ class Config:
     ckpt_every: int = 5000
     log_every: int = 50
 
+    # dataset-scale guard (see check_dataset_scale below) -- set True only
+    # for a deliberately small-scale run (e.g. a unit test against a
+    # synthetic few-episode dataset).
+    allow_high_epoch_equivalent: bool = False
+
     @classmethod
     def load(cls, path: str | Path) -> "Config":
         data = json.loads(Path(path).read_text())
@@ -145,6 +194,69 @@ class Config:
             shape=self.loss_w_shape,
             cls=self.loss_w_cls,
             rotation=self.loss_w_rotation,
+        )
+
+
+# --- dataset-scale guard -------------------------------------------------------
+#
+# V6.1 root cause (see DESIGN.md's V6.1 postmortem): a full 25k-step run was
+# launched against a perception-v1 dataset that only had 500 total episodes
+# (458 train, 45,800 rendered train frames) -- a placeholder-scale dataset,
+# an order of magnitude below wm-scenes-v1's dynamics-v1 dataset (10,000
+# episodes). At batch_size=128 that run drew 25,000 * 128 = 3,200,000
+# samples, i.e. each of the 45,800 train frames was trained on ~69.9 times
+# over ("epoch-equivalent" below). PerceptionDETR memorized the tiny,
+# low-diversity train set well before step 1000 (train loss fell smoothly
+# to ~0.19 by step 25k) while val matched_pos_err sat flat at the
+# mean-predictor floor (~0.6-0.67m) for the *entire* run and val loss
+# diverged monotonically (2.18 at step 1000 -> 8.87 at step 25000) -- a
+# textbook train/val divergence curve, confirmed by running the exact val
+# evaluation code path on held-out TRAIN frames (median matched_pos_err
+# 0.12m) vs real VAL frames (0.61m) from the same checkpoint: the eval
+# pipeline itself is correct, the model just never had a chance to learn
+# anything but memorize.
+#
+# MAX_EPOCH_EQUIVALENT is a heuristic guard against repeating that mistake:
+# training refuses to start (loud failure, not a silently-wasted 25k-step
+# run) whenever the configured step budget implies training on each frame
+# more than this many times over, unless the run explicitly opts in via
+# ``allow_high_epoch_equivalent=True`` (e.g. a deliberately tiny smoke/unit
+# -test dataset). 15x is itself generous -- the actual incident's overfit
+# curve was already fully collapsed by ~2.8x (step 1000) -- but is kept
+# well above normal legitimate epoch counts for a healthy-sized dataset so
+# this never fires on a properly-provisioned training run.
+MAX_EPOCH_EQUIVALENT = 15.0
+
+
+def epoch_equivalent(steps: int, batch_size: int, n_train_frames: int) -> float:
+    """How many times, on average, the step budget trains on each of
+    ``n_train_frames`` train frames -- ``steps * batch_size / n_train_frames``.
+    ``inf`` if there are no train frames at all (caller should already have
+    raised on that, see ``make_loader``)."""
+    if n_train_frames <= 0:
+        return float("inf")
+    return steps * batch_size / n_train_frames
+
+
+def check_dataset_scale(cfg: "Config", n_train_frames: int) -> None:
+    """Raise ``ValueError`` if ``cfg``'s step budget implies training on
+    each train frame more than :data:`MAX_EPOCH_EQUIVALENT` times over --
+    see the module-level comment above for why (this is the exact V6.1
+    failure mode: a tiny dataset trained on far too long, silently
+    memorized instead of generalized, and the smoke test -- which only
+    checks train loss -- never caught it)."""
+    eq = epoch_equivalent(cfg.steps, cfg.batch_size, n_train_frames)
+    if eq > MAX_EPOCH_EQUIVALENT and not cfg.allow_high_epoch_equivalent:
+        raise ValueError(
+            f"perception training dataset too small for this step budget: {n_train_frames} train "
+            f"frames, steps={cfg.steps}, batch_size={cfg.batch_size} -> epoch-equivalent={eq:.1f}x "
+            f"(each frame would be trained on ~{eq:.1f} times), exceeds MAX_EPOCH_EQUIVALENT="
+            f"{MAX_EPOCH_EQUIVALENT:.1f}. This is the exact failure mode that produced perception-v1's "
+            "V6 flat val matched_pos_err (~0.6m, mean-predictor level) despite falling train loss -- see "
+            "train_perception.py's module-level comment / DESIGN.md's V6.1 postmortem: the model "
+            "memorizes a too-small train set instead of learning generalizable geometry. Generate more "
+            "episodes (`gltfworld generate --render` + `gltfworld pack`) or, if this is a deliberately "
+            "small-scale run (e.g. a unit test), set allow_high_epoch_equivalent=True in the config."
         )
 
 
@@ -324,7 +436,7 @@ def evaluate(model: torch.nn.Module, val_iter, cfg: Config, device: torch.device
 # --- main training loop -------------------------------------------------------------
 
 
-def train(cfg: Config, out_dir: Path, resume: bool, smoke: bool) -> dict:
+def train(cfg: Config, out_dir: Path, resume: bool, smoke: bool, smoke_val: bool = False) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     set_seed(cfg.seed)
 
@@ -332,13 +444,48 @@ def train(cfg: Config, out_dir: Path, resume: bool, smoke: bool) -> dict:
     autocast_dtype = torch.bfloat16
     autocast_enabled = cfg.bf16
 
+    # The LR schedule's horizon must stay pinned to the *configured* full-run
+    # step count, not whatever --smoke/--smoke-val truncate the loop to below
+    # -- a short run is only a faithful proxy for "the early portion of a
+    # real run" if its LR trajectory actually matches the real run's early
+    # portion. Get this wrong (as an earlier version of --smoke-val did: it
+    # passed the *truncated* step count as the scheduler's own T_max) and a
+    # 2500-step run anneals its LR from 2e-4 down to ~1e-5 *within those 2500
+    # steps* -- e.g. by step 2000 LR had already collapsed to ~2.8e-5, vs the
+    # ~1.97e-4 a real 25k-step schedule still has at step 2000 -- starving
+    # the exact short run that's supposed to demonstrate the dataset fix
+    # works. Captured *before* the smoke/smoke_val overrides below so it's
+    # always the user's real configured horizon (or the smoke/smoke-val
+    # override's own value, when steps isn't otherwise set -- Config's
+    # default of 25_000 covers that case too).
+    lr_schedule_steps = cfg.steps
+
     if smoke:
         cfg = dataclasses.replace(cfg, steps=500, val_every=100, val_batches=2, ckpt_every=500, log_every=10)
+    elif smoke_val:
+        # ~5,000 steps (~1.8 epoch-equivalents on the 4,000-episode pack's
+        # 363,600 train frames, see epoch_equivalent) -- long enough to
+        # actually distinguish real (if partial) generalization from
+        # under-training noise, since --smoke's 500 steps only ever checked
+        # train loss (exactly the gap that let V6's flat-val pathology
+        # through, see check_dataset_scale's module-level comment) and
+        # V6.1's original ~1800-step (0.63 epoch-equivalent) window turned
+        # out to be too short to tell "the dataset fix didn't work" apart
+        # from "hasn't trained long enough yet" -- see the module docstring's
+        # V6.2 recalibration note. val_every=500 puts the first evaluation
+        # exactly at step 500, which the pass/fail check below uses as its
+        # baseline. lr_schedule_steps (above) keeps the LR trajectory across
+        # these 5,000 steps matching the first 5,000 steps of the *real*,
+        # full-length (cfg.steps, typically 25k) schedule -- not a
+        # from-scratch 5,000-step anneal, which would collapse the LR far
+        # too fast to show any real learning at all.
+        cfg = dataclasses.replace(cfg, steps=5000, val_every=500, val_batches=8, ckpt_every=5000, log_every=50)
 
     cfg.save(out_dir / "config.json")
 
     train_loader = make_loader(cfg, "train", shuffle=True)
     val_loader = make_loader(cfg, "val", shuffle=True)
+    check_dataset_scale(cfg, len(train_loader.dataset))
     train_iter = _infinite_loader(train_loader)
     val_iter = _infinite_loader(val_loader)
 
@@ -348,7 +495,7 @@ def train(cfg: Config, out_dir: Path, resume: bool, smoke: bool) -> dict:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(cfg.steps, 1), eta_min=cfg.lr * cfg.min_lr_ratio
+        optimizer, T_max=max(lr_schedule_steps, 1), eta_min=cfg.lr * cfg.min_lr_ratio
     )
 
     global_step = 0
@@ -365,6 +512,7 @@ def train(cfg: Config, out_dir: Path, resume: bool, smoke: bool) -> dict:
     log_file, log_writer = _csv_writer(out_dir / "log.csv", resuming=(global_step > 0))
 
     train_loss_history: list[tuple[int, float, float]] = []  # (step, raw_loss, ema_loss)
+    val_pos_err_history: list[tuple[int, float]] = []  # (step, matched_pos_err_m)
     t_start = time.time()
     model.train()
 
@@ -412,6 +560,7 @@ def train(cfg: Config, out_dir: Path, resume: bool, smoke: bool) -> dict:
 
             if global_step % cfg.val_every == 0 or global_step == cfg.steps:
                 val_metrics = evaluate(model, val_iter, cfg, device, cfg.val_batches)
+                val_pos_err_history.append((global_step, val_metrics["matched_pos_err_m"]))
                 log_writer.writerow(
                     {
                         "step": global_step,
@@ -450,8 +599,32 @@ def train(cfg: Config, out_dir: Path, resume: bool, smoke: bool) -> dict:
         "global_step": global_step,
         "n_params": n_params,
         "train_loss_history": train_loss_history,
+        "val_pos_err_history": val_pos_err_history,
         "best_val": best_val,
     }
+
+
+# --smoke-val's two-part pass bar (V6.2 recalibration, see the module
+# docstring's "V6.2 recalibration of --smoke-val" note and DESIGN.md's V6.2
+# postmortem). Both conditions must hold -- neither alone is a good enough
+# generalization signal:
+#
+# (a) SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT: val matched_pos_err at the final
+#     step must be at least this fraction *better* than its value at step
+#     500 (the run's first val evaluation, val_every=500 above) -- a flat
+#     curve (the V6 pathology, and what both of the ~1800-step V6.1
+#     confirmation runs actually showed) fails this outright, regardless of
+#     its absolute level.
+# (b) SMOKE_VAL_POS_ERR_BOUND_M: the final value must also be below this
+#     absolute bound -- an "improvement" from a catastrophic baseline to a
+#     still-bad value should not pass on relative improvement alone. The V6
+#     pathology's flat val matched_pos_err plateau was ~0.6-0.67m
+#     (mean-predictor level for the ~1.5m workspace); this bound sits below
+#     that with margin for a short, noisier ~5,000-step run (looser than
+#     V6.1's 0.45m bound, since the relative-improvement condition (a) now
+#     carries most of the weight of proving real learning happened).
+SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT = 0.15
+SMOKE_VAL_POS_ERR_BOUND_M = 0.55
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -460,10 +633,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="500-step fast correctness check; exits 0/1")
+    parser.add_argument(
+        "--smoke-val",
+        action="store_true",
+        help=(
+            "~5,000-step fast *generalization* check (~1.8 epoch-equivalents on the 4,000-episode pack, "
+            "~20-30 min on GPU); exits 0/1. Unlike --smoke (which only ever checks train loss -- exactly "
+            "the gap that let V6's flat-val-matched_pos_err pathology through undetected for a full "
+            "25k-step run), this asserts val matched_pos_err both improves >= "
+            "SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT from its step-500 value and drops below "
+            "SMOKE_VAL_POS_ERR_BOUND_M (see the module docstring's V6.2 recalibration note for why the "
+            "window and bar both changed from V6.1's original ~1800-step/single-improvement version)."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.smoke and args.smoke_val:
+        parser.error("--smoke and --smoke-val are mutually exclusive")
 
     cfg = Config.load(args.config)
-    result = train(cfg, args.out, resume=args.resume, smoke=args.smoke)
+    result = train(cfg, args.out, resume=args.resume, smoke=args.smoke, smoke_val=args.smoke_val)
 
     if args.smoke:
         history = result["train_loss_history"]
@@ -481,6 +669,43 @@ def main(argv: list[str] | None = None) -> int:
             print(f"SMOKE FAIL: ema loss only dropped {drop_ema * 100:.1f}%, need >= 30%")
             return 1
         print("SMOKE PASS")
+        return 0
+
+    if args.smoke_val:
+        history = result["val_pos_err_history"]
+        if len(history) < 2:
+            print(f"SMOKE-VAL FAIL: only {len(history)} val evaluation(s), need >= 2 to see a trend")
+            return 1
+        baseline_step, baseline_err = history[0]
+        if baseline_step != 500:
+            print(
+                f"SMOKE-VAL FAIL: first val evaluation was at step {baseline_step}, expected step 500 "
+                "(val_every misconfigured?) -- cannot compute the step-500 baseline the acceptance bar needs"
+            )
+            return 1
+        last_step, last_err = history[-1]
+        relative_improvement = (baseline_err - last_err) / baseline_err if baseline_err > 0 else 0.0
+        print(
+            f"smoke-val: val matched_pos_err @ step {baseline_step} = {baseline_err:.4f}m -> "
+            f"@ step {last_step} = {last_err:.4f}m (relative improvement {relative_improvement * 100:.1f}%)"
+        )
+        # both conditions must hold -- see SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT/
+        # SMOKE_VAL_POS_ERR_BOUND_M's module-level comment for why neither
+        # alone is sufficient.
+        if relative_improvement < SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT:
+            print(
+                f"SMOKE-VAL FAIL: val matched_pos_err improved only {relative_improvement * 100:.1f}% from its "
+                f"step-{baseline_step} value ({baseline_err:.4f}m -> {last_err:.4f}m), need >= "
+                f"{SMOKE_VAL_MIN_RELATIVE_IMPROVEMENT * 100:.1f}%"
+            )
+            return 1
+        if not (last_err < SMOKE_VAL_POS_ERR_BOUND_M):
+            print(
+                f"SMOKE-VAL FAIL: final val matched_pos_err {last_err:.4f}m >= bound "
+                f"{SMOKE_VAL_POS_ERR_BOUND_M:.4f}m (never left mean-predictor territory)"
+            )
+            return 1
+        print("SMOKE-VAL PASS")
         return 0
 
     return 0

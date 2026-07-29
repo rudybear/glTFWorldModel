@@ -6,6 +6,7 @@ and the full set-prediction loss (shape/finiteness/backward)."""
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from gltfworld.models.matching import (
@@ -14,15 +15,18 @@ from gltfworld.models.matching import (
     SPHERE_IDX,
     CUBE_SYMMETRY_QUATS,
     MatchCostWeights,
+    WorkspaceFilterStats,
     axis_alignment_angle,
     box_min_symmetry_angle,
     compute_perception_losses,
+    filter_out_of_box_gt,
     hungarian_match,
+    in_workspace_box,
     quat_to_local_y_axis,
     symmetry_rotation_angle,
     symmetry_rotation_loss,
 )
-from gltfworld.models.perception import PerceptionDETR
+from gltfworld.models.perception import POS_MAX, POS_MIN, PerceptionDETR
 from gltfworld.models.rotations import axis_angle_to_quat, quat_hemisphere, quat_multiply, quat_normalize, quat_to_matrix
 
 torch.manual_seed(0)
@@ -264,3 +268,131 @@ def test_compute_perception_losses_zero_for_perfect_prediction():
     assert comps["shape"] < 1e-3  # sphere is shape 0 -> uniform logits -> some CE, but small vs a wrong prediction
     assert comps["cls"] < 1e-3
     assert comps["existence"] < 1e-3
+
+
+# --- out-of-box GT filtering (V6.2 data-defect fix) ----------------------------
+#
+# See matching.py's own module-level comment / DESIGN.md's V6.2 postmortem:
+# some wm-scenes-v1 objects escape the finite ground plate over an episode
+# and end up outside the model's representable [POS_MIN, POS_MAX] workspace
+# box -- unobservable and unrepresentable, so both training supervision and
+# eval matching must treat them as absent for that frame, not merely
+# "unsupervised on pose".
+
+
+def test_in_workspace_box_true_inside_false_outside():
+    position = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],  # inside
+            [0.0, -30.4, 17.4],  # matches the diagnostic's observed escaped-object extremes
+        ]
+    )
+    inside = in_workspace_box(position)
+    assert inside.tolist() == [True, False]
+
+
+def test_in_workspace_box_respects_pos_min_pos_max_boundaries():
+    # exactly on the boundary must count as inside (inclusive bounds).
+    on_min_boundary = torch.tensor([list(POS_MIN)])
+    on_max_boundary = torch.tensor([list(POS_MAX)])
+    assert in_workspace_box(on_min_boundary).item() is True
+    assert in_workspace_box(on_max_boundary).item() is True
+
+    just_outside = torch.tensor([[POS_MAX[0] + 0.01, POS_MAX[1], POS_MAX[2]]])
+    assert in_workspace_box(just_outside).item() is False
+
+
+def test_filter_out_of_box_gt_excludes_escaped_object_and_reports_fraction():
+    gt_position = torch.tensor([[[0.5, 0.5, 0.5], [0.0, -30.4, 17.4]]])  # (1, 2, 3): in-box, escaped
+    gt_mask = torch.tensor([[True, True]])
+
+    filtered_mask, stats = filter_out_of_box_gt(gt_position, gt_mask)
+    assert filtered_mask.tolist() == [[True, False]]
+    assert isinstance(stats, WorkspaceFilterStats)
+    assert stats.n_eligible == 2
+    assert stats.n_out_of_box == 1
+    assert stats.fraction_out_of_box == pytest.approx(0.5)
+
+
+def test_filter_out_of_box_gt_is_noop_when_everything_in_box():
+    gt_position = torch.zeros(2, 3, 3)
+    gt_mask = torch.tensor([[True, True, False], [True, False, False]])
+    filtered_mask, stats = filter_out_of_box_gt(gt_position, gt_mask)
+    assert torch.equal(filtered_mask, gt_mask)
+    assert stats.n_out_of_box == 0
+    assert stats.fraction_out_of_box == 0.0
+
+
+def test_filter_out_of_box_gt_never_resurrects_an_already_absent_row():
+    # a padded/nonexistent GT row (mask False) that happens to sit at the
+    # origin (in-box) must stay excluded -- the filter can only ever remove
+    # eligibility, never add it back.
+    gt_position = torch.zeros(1, 2, 3)
+    gt_mask = torch.tensor([[True, False]])
+    filtered_mask, stats = filter_out_of_box_gt(gt_position, gt_mask)
+    assert filtered_mask.tolist() == [[True, False]]
+    assert stats.n_eligible == 1
+    assert stats.n_out_of_box == 0
+
+
+def test_compute_perception_losses_excludes_out_of_box_gt_from_matching_and_supervision():
+    """One in-box GT object + one out-of-box (escaped) GT object -- only the
+    in-box one may be matched/supervised; the escaped object must be
+    invisible to both Hungarian matching and existence supervision, and the
+    reported ``workspace_filtered_fraction`` must reflect it (this is the
+    exact synthetic scenario DESIGN.md's V6.2 postmortem calls for)."""
+    model = PerceptionDETR()
+    rgb = torch.rand(1, 256, 256, 3)
+    out = model(rgb)
+
+    n_max = 5
+    states = torch.zeros(1, n_max, 22)
+    states[0, 0, 0:3] = torch.tensor([0.5, 0.5, 0.5])  # in-box
+    states[0, 1, 0:3] = torch.tensor([0.0, -30.4, 17.4])  # escaped -- well outside POS_MIN/POS_MAX
+    states[..., 6] = 1.0  # identity quat w component everywhere
+    mask = torch.zeros(1, n_max, dtype=torch.bool)
+    mask[0, :2] = True  # both rows are existence-eligible *before* the workspace filter
+    class_ids = torch.zeros(1, n_max, dtype=torch.long)
+
+    total, comps, matches = compute_perception_losses(out, states, mask, class_ids)
+    assert torch.isfinite(total)
+    assert comps["workspace_filtered_fraction"] == pytest.approx(0.5)
+
+    query_idx, gt_idx = matches[0]
+    assert 1 not in gt_idx.tolist(), "the escaped (out-of-box) GT object must never be Hungarian-matched"
+    assert query_idx.size <= 1  # at most the in-box object (gt slot 0) can be matched at all
+
+
+def test_compute_perception_losses_out_of_box_gt_never_supervises_existence():
+    """A query whose position happens to land exactly on the escaped
+    (out-of-box) GT object's coordinates must still not be pulled toward
+    existence=1 for it -- the escaped row is masked out before matching, so
+    no query can ever be assigned to it, no matter how close a prediction
+    gets."""
+    n_queries = 5
+    n_max = 5
+    escaped_pos = torch.tensor([0.0, -30.4, 17.4])
+
+    pred = {
+        "existence_logit": torch.zeros(1, n_queries),
+        "position": escaped_pos.expand(1, n_queries, 3).clone(),
+        "quat": torch.tensor([0.0, 0.0, 0.0, 1.0]).expand(1, n_queries, 4).clone(),
+        "size": torch.zeros(1, n_queries, 3),
+        "shape_logits": torch.zeros(1, n_queries, 3),
+        "class_logits": torch.zeros(1, n_queries, 3),
+    }
+
+    states = torch.zeros(1, n_max, 22)
+    states[0, 0, 0:3] = escaped_pos  # only GT object is the escaped one
+    states[..., 6] = 1.0
+    mask = torch.zeros(1, n_max, dtype=torch.bool)
+    mask[0, 0] = True
+    class_ids = torch.zeros(1, n_max, dtype=torch.long)
+
+    total, comps, matches = compute_perception_losses(pred, states, mask, class_ids)
+    query_idx, gt_idx = matches[0]
+    assert query_idx.size == 0 and gt_idx.size == 0
+    assert comps["workspace_filtered_fraction"] == pytest.approx(1.0)
+    # no match at all -> existence loss trains every query toward 0 (target
+    # all-zero), never toward "this escaped object exists".
+    assert comps["existence"] > 0.0  # BCE(logit=0, target=0) is not exactly 0

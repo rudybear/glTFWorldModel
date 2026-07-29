@@ -112,7 +112,7 @@ def test_render_check_with_shared_renderer(tmp_path: Path, episode_renderer):
     model.eval()
 
     ds = PerceptionDataset(EPISODES_DIR, PACK_FILE, split="test")
-    records = run_inference(model, ds, device, batch_size=16)
+    records, _workspace_stats = run_inference(model, ds, device, batch_size=16)
 
     out_dir = tmp_path / "eval"
     out_dir.mkdir(parents=True)

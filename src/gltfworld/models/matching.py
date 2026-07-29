@@ -1,6 +1,18 @@
 """Hungarian matching + DETR-style set-prediction loss for
 ``gltfworld.models.perception.PerceptionDETR``.
 
+Out-of-box GT filtering (:func:`filter_out_of_box_gt`)
+-------------------------------------------------------
+
+Applied first, inside :func:`compute_perception_losses` and by
+``gltfworld.eval.perception_eval`` directly, before any matching happens: a
+GT object whose position lies outside the model's representable
+``[POS_MIN, POS_MAX]`` workspace box (``gltfworld.models.perception`` --
+some `wm-scenes-v1` objects escape the finite ground plate over an episode)
+is treated as *absent* for that frame, not merely "unsupervised on pose" --
+existence supervision/eval skips it too. See DESIGN.md's V6.2 postmortem for
+the full rationale and measured fractions.
+
 Matching (:func:`hungarian_match`)
 -----------------------------------
 
@@ -59,6 +71,7 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
+from gltfworld.models.perception import POS_MAX, POS_MIN
 from gltfworld.models.rotations import matrix_to_quat, quat_geodesic_angle, quat_multiply, quat_to_matrix
 from gltfworld.scene.contract import SHAPE_ORDER
 
@@ -172,6 +185,71 @@ def symmetry_rotation_loss(pred_quat: torch.Tensor, gt_quat: torch.Tensor, shape
     return symmetry_rotation_angle(pred_quat, gt_quat, shape_idx) ** 2
 
 
+# --- out-of-box GT filtering (V6.2 data-defect fix) --------------------------
+#
+# See DESIGN.md's V6.2 postmortem: a small but nonzero fraction of
+# `wm-scenes-v1` objects escape the finite ground plate over the course of an
+# episode (observed extremes: y=-30.4m, z=+17.4m) -- physically real
+# trajectories that end up both (a) outside the fixed camera's frustum (never
+# actually visible in the rendered RGB frame the model is asked to predict
+# from) and (b) outside the position head's representable
+# `[POS_MIN, POS_MAX]` workspace box (`gltfworld.models.perception` -- the
+# sigmoid-into-box parameterization makes it *structurally impossible* for
+# any query to ever emit a position in that region). Treating such an object
+# as "exists, supervise its pose" -- as every code path did before this fix --
+# poisons both training (an unreachable regression target that can only ever
+# contribute noise/bias to the position loss) and eval (a match that can
+# never score well for a reason that has nothing to do with model quality).
+# Measured fractions of existence-eligible GT rows affected, on the
+# 4,000-episode `perception-v1` pack: train 4.51%, val 4.85%, test 3.60%.
+#
+# Implemented once here and shared by both the training loss
+# (:func:`compute_perception_losses`) and eval matching
+# (`gltfworld.eval.perception_eval.run_inference`/`run_inference_baseline`)
+# so the two code paths can never quietly disagree about which GT objects are
+# "real" for a frame -- an out-of-box GT object is treated as *absent* (not
+# just "unsupervised on pose"): existence supervision/eval skips it too,
+# exactly as if it had never existed for that frame.
+
+
+def in_workspace_box(position: torch.Tensor) -> torch.Tensor:
+    """``position`` (..., 3) -> bool (...,), True wherever every coordinate
+    lies within the model's representable workspace box
+    ``[POS_MIN, POS_MAX]`` (``gltfworld.models.perception``)."""
+    pos_min = position.new_tensor(POS_MIN)
+    pos_max = position.new_tensor(POS_MAX)
+    return ((position >= pos_min) & (position <= pos_max)).all(dim=-1)
+
+
+@dataclass
+class WorkspaceFilterStats:
+    """``n_eligible``/``n_out_of_box`` counts (of GT rows that were
+    ``gt_mask``-eligible *before* this filter) -- callers print/log
+    :attr:`fraction_out_of_box` so the defect's impact stays visible (see
+    ``gltfworld.data.pack``/``gltfworld.eval.perception_eval``)."""
+
+    n_eligible: int
+    n_out_of_box: int
+
+    @property
+    def fraction_out_of_box(self) -> float:
+        return (self.n_out_of_box / self.n_eligible) if self.n_eligible > 0 else 0.0
+
+
+def filter_out_of_box_gt(
+    gt_position: torch.Tensor, gt_mask: torch.Tensor
+) -> tuple[torch.Tensor, WorkspaceFilterStats]:
+    """``gt_position`` (..., N_max, 3), ``gt_mask`` (..., N_max) bool ->
+    ``(filtered_mask, stats)`` -- ``filtered_mask`` is ``gt_mask`` with any
+    row whose position lies outside ``[POS_MIN, POS_MAX]`` additionally
+    cleared. See the module-level comment above for why."""
+    in_box = in_workspace_box(gt_position)
+    filtered_mask = gt_mask & in_box
+    n_eligible = int(gt_mask.sum().item())
+    n_out_of_box = int((gt_mask & ~in_box).sum().item())
+    return filtered_mask, WorkspaceFilterStats(n_eligible=n_eligible, n_out_of_box=n_out_of_box)
+
+
 # --- Hungarian matching -------------------------------------------------------
 
 
@@ -264,7 +342,8 @@ def compute_perception_losses(
     (B, N_max)``), then compute the full weighted set-prediction loss.
 
     Returns ``(total_loss, components, matches)`` -- ``components`` are
-    detached floats for logging, ``matches`` is :func:`hungarian_match`'s
+    detached floats for logging (including ``workspace_filtered_fraction``,
+    see :func:`filter_out_of_box_gt`), ``matches`` is :func:`hungarian_match`'s
     per-sample ``(query_idx, gt_idx)`` output (reused by eval so matching
     logic never has two implementations).
     """
@@ -276,6 +355,12 @@ def compute_perception_losses(
     gt_quat = states[..., 3:7]
     gt_shape_idx = states[..., 13:16].argmax(dim=-1)
     gt_size = states[..., 16:19]
+
+    # V6.2 fix: exclude GT objects that escaped the representable workspace
+    # box before matching -- see filter_out_of_box_gt's module-level comment.
+    # An out-of-box GT row is now treated as absent for that frame: no query
+    # can be Hungarian-matched to it, so its existence target stays 0 too.
+    mask, workspace_stats = filter_out_of_box_gt(gt_position, mask)
 
     matches = hungarian_match(
         pred["position"], pred["class_logits"], pred["size"], gt_position, class_ids, gt_size, mask, cost_weights
@@ -340,5 +425,6 @@ def compute_perception_losses(
         "shape": float(shape_loss.detach()),
         "cls": float(cls_loss.detach()),
         "rotation": float(rot_loss.detach()),
+        "workspace_filtered_fraction": workspace_stats.fraction_out_of_box,
     }
     return total, components, matches

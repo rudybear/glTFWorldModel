@@ -17,9 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
 from safetensors.numpy import save_file
 
 from gltfworld.datagen.sample import object_support_offset
+from gltfworld.models.matching import filter_out_of_box_gt
 from gltfworld.scene.contract import (
     CATEGORY_TO_CLASS_ID,
     GLOBALS_DIM,
@@ -65,6 +67,37 @@ class PackResult:
     n_max: int
     t: int
     split_counts: dict[str, int]
+    workspace_filter: dict[str, dict]
+
+
+def _workspace_filter_report(states_arr: np.ndarray, mask_arr: np.ndarray, split_arr: np.ndarray) -> dict[str, dict]:
+    """Per-split (train/val/test) report of the V6.2 out-of-box GT defect
+    (see ``gltfworld.models.matching.filter_out_of_box_gt``'s module-level
+    comment / DESIGN.md's V6.2 postmortem): some ``wm-scenes-v1`` objects
+    escape the finite ground plate over the course of an episode and end up
+    outside the perception model's representable ``[POS_MIN, POS_MAX]``
+    workspace box -- unobservable and unrepresentable, so training/eval must
+    treat them as absent. Reported (and printed by :func:`pack_dataset`) here
+    at pack time, over every ``(episode, frame, object)`` triple with
+    ``mask`` true, so the defect's scale stays visible independent of
+    whatever training/eval run happens to look at the pack later.
+    """
+    t = states_arr.shape[1]
+    report: dict[str, dict] = {}
+    for split_index, name in enumerate(SPLIT_NAMES):
+        sel = split_arr == split_index
+        if not sel.any():
+            report[name] = {"n_eligible": 0, "n_out_of_box": 0, "fraction_out_of_box": 0.0}
+            continue
+        gt_position = torch.from_numpy(states_arr[sel][..., 0:3])  # (E_sel, T, n_max, 3)
+        mask_t = torch.from_numpy(mask_arr[sel])[:, None, :].expand(-1, t, -1)  # (E_sel, T, n_max)
+        _filtered_mask, stats = filter_out_of_box_gt(gt_position, mask_t)
+        report[name] = {
+            "n_eligible": stats.n_eligible,
+            "n_out_of_box": stats.n_out_of_box,
+            "fraction_out_of_box": stats.fraction_out_of_box,
+        }
+    return report
 
 
 def _pack_meta_path(out_file: Path) -> Path:
@@ -218,6 +251,15 @@ def pack_dataset(episodes_dir: str | Path, out_file: str | Path, *, n_max: int =
 
     split_counts = {name: int(np.sum(split_arr == i)) for i, name in enumerate(SPLIT_NAMES)}
 
+    workspace_filter = _workspace_filter_report(states_arr, mask_arr, split_arr)
+    for name in SPLIT_NAMES:
+        wf = workspace_filter[name]
+        print(
+            f"pack: split={name!r}: {wf['n_out_of_box']}/{wf['n_eligible']} eligible GT objects "
+            f"({wf['fraction_out_of_box'] * 100:.2f}%) fall outside the representable [POS_MIN, POS_MAX] "
+            "workspace box (see DESIGN.md's V6.2 postmortem)"
+        )
+
     ground_top_ys_arr = np.array(ground_top_ys, dtype=np.float64) if ground_top_ys else np.zeros(0)
     ground_top_y_stats = {
         "min": float(ground_top_ys_arr.min()) if ground_top_ys_arr.size else None,
@@ -259,10 +301,17 @@ def pack_dataset(episodes_dir: str | Path, out_file: str | Path, *, n_max: int =
         "split_counts": split_counts,
         "ground_top_y": ground_top_y_stats,
         "ground_footprint": ground_footprint_stats,
+        "workspace_filter": workspace_filter,
     }
     meta_path = _pack_meta_path(out_file)
     meta_path.write_text(json.dumps(meta, indent=2))
 
     return PackResult(
-        out_file=out_file, meta_path=meta_path, count=len(episode_paths), n_max=n_max, t=t_ref, split_counts=split_counts
+        out_file=out_file,
+        meta_path=meta_path,
+        count=len(episode_paths),
+        n_max=n_max,
+        t=t_ref,
+        split_counts=split_counts,
+        workspace_filter=workspace_filter,
     )
