@@ -361,3 +361,158 @@ per-recorded-frame computation (the same semantics `wm-scenes-v1`'s
 documented default, `(0, -9.81, 0)` -- an assumption, not independently
 re-derived per trial (a direct finite-difference re-derivation was tried and
 rejected as unreliable for the same substep reason as `dt` above).
+
+## Physion conversion findings (V8 stage 2, `gltfworld.physion.convert`)
+
+Every real impedance mismatch hit converting HDF5 -> glTF, in the order a
+reader would hit them. This is the primary gap-report evidence this
+milestone produces (DESIGN.md's V9 scope draws on this section directly).
+Verified against 3 real converted Collide trials (see
+`tests/test_physion_convert.py`): validator **0 errors**, real mesh
+POSITION/NORMAL/indices accessors round-trip bit-exact, pose-animation frame
+count equals the source HDF5's frame count exactly, and poses/velocities/
+physics metadata round-trip through the *existing*, unmodified
+`gltfworld.scene.convert.episode_from_gltf` to <=1e-5 absolute.
+
+1. **No normals at all.** HDF5 carries only `mesh/vertices_i`/`faces_i` --
+   raw positions and triangle indices, no per-vertex or per-face normal
+   data anywhere. `compute_vertex_normals` derives them (area-weighted
+   per-vertex average of adjacent face normals, an un-normalized
+   cross-product magnitude as the area weight) -- a real, lossy
+   approximation of whatever smooth/authored normals the original TDW
+   asset actually used for shading, unrecoverable from triangulated face
+   data alone. Every converted mesh's normals are therefore *faceted*
+   relative to the original renders (visible on any smoothly-curved asset,
+   e.g. the `sphere`/`torus`/`cone` primitives seen in Collide), not a
+   faithful reproduction.
+
+2. **Mesh pivot vs. geometric center.** TDW's own primitives are
+   base-pivoted: local vertex Y ranges `[0, height]`, not `[-height/2,
+   height/2]` (verified: the `cube`/`cone`/`sphere` assets in Collide all
+   have `vmin.y == 0`). `frames/*/objects/positions` is this pivot, not the
+   object's true center (`frames/*/objects/center` is a *separate*,
+   unused-by-this-conversion dataset that *is* the true center). gltfworld
+   reuses the raw pivot position as the glTF node's translation directly
+   (so the *visual* mesh -- real vertices, unmodified -- renders in exactly
+   the right place), but this means the **KHR-physics collider
+   approximation is generally displaced from the visual mesh's true
+   center** along the local pivot-to-center vector: our pinned
+   `KHR_implicit_shapes` subset (`gltfworld.ext.khr_physics`) has no
+   local-offset/local-transform field for a shape, only an implicit
+   "centered on the node origin" assumption -- a real schema limitation
+   this conversion surfaces, not something gltfworld's codec chose to
+   paper over. (`classify_bounding_shape`'s returned `center` *is* computed
+   correctly and is available to any caller that wants the true center for
+   other purposes -- see stage 3's contact-geometry math, which does use
+   it -- it's specifically the *KHR-physics encoding* that has nowhere to
+   put it.)
+
+3. **Two friction coefficients collapse into one.** HDF5 carries
+   `static_friction`/`dynamic_friction` as two independent per-object
+   values (real Coulomb-friction physics distinguishes them);
+   `ObjectSpec.friction` (and `KHR_physics_rigid_bodies`' physics-material
+   schema, as gltfworld encodes it) has exactly one friction field. This
+   conversion averages the two -- a real, lossy information collapse (not
+   a bug in either format; gltfworld's own physics-material encoding was
+   built against `wm-scenes-v1`'s single-friction-value physics distribution
+   and never needed a second coefficient before).
+
+4. **No generic/convex mesh collider type, so *some* shape-type
+   approximation for physics is unavoidable regardless of transport
+   quality.** `classify_bounding_shape`'s AABB-isotropy sphere/box
+   classifier (shared verbatim with stage 3's dynamics-tensor mapping, one
+   documented approximation instead of two) cannot represent a cylinder at
+   all (gltfworld's whole shape vocabulary, `gltfworld.scene.scene.SHAPES`,
+   trained-model-compatible or not, is only sphere/box/cylinder) --
+   distinguishing a true cylinder from a box by AABB alone isn't possible
+   without also inspecting the mesh's actual radial symmetry, not attempted
+   here. Every non-sphere Physion asset (`cone`, `torus`, `dumbbell`,
+   `linbrazil_diz_armchair`, ...) is therefore boxed, however round it
+   visually is -- confirmed directly against the 3 converted trials:
+   `cone`/`torus`/`dumbbell` (the `target`/agent role in each) all
+   classified `"box"`.
+
+5. **Chirality/handedness: TDW/Unity is left-handed; gltfworld's transport
+   convention is right-handed.** Verified two ways: (a) the per-object
+   quaternion (`objects/rotations`, component order `x,y,z,w`) reproduces
+   `objects/forwards` *exactly* via the standard right-handed
+   quaternion-rotate formula applied to the raw, unmodified HDF5
+   coordinates -- self-consistent within TDW's own frame; (b) the camera's
+   `camera_matrix` rotation block has **determinant -1** under that same
+   naive right-handed read (not a numerical artifact -- checked
+   `R @ R.T == I` to confirm it's a genuine orthonormal-but-improper
+   transform, not noise), consistent with a left-handed world composed
+   with a chirality-flipping camera projection. gltfworld deliberately
+   does **not** apply any chirality-correcting flip anywhere in this
+   conversion: positions/velocities/quaternions/mesh vertices are all
+   reused as-is. This has **zero effect on every metric stage 3 computes**
+   (Euclidean distance, contact thresholds, velocity magnitude, and the
+   dynamics model's own features are all invariant under a single global
+   mirror of all coordinates together) -- but it does mean a GLB from this
+   conversion, rendered by an ordinary right-handed glTF viewer, would show
+   a left-right-mirrored scene relative to Physion's own rendered
+   `mp4s`/`mp4s-redyellow` for the *same* trial. Documented as a known,
+   deliberately-unaddressed, low-impact limitation, not a silent bug.
+
+6. **Camera orientation is synthesized, not decoded.** Because of finding
+   5, `_decode_camera` does not attempt to turn the real `camera_matrix`
+   into a glTF camera rotation (that would require resolving which axis
+   the chirality flip belongs to, which the data alone doesn't disambiguate
+   without a rendered-pixel ground truth to check against -- out of this
+   milestone's scope). It uses the matrix's *translation* half (handedness-
+   independent: `camera_position = -R^T @ t`, a real, correctly-decoded
+   world position) and synthesizes a look-at orientation aimed at the
+   scene's frame-0 object centroid instead. `yfov` is read from the
+   projection matrix's `[1,1]` entry under the standard OpenGL
+   `1/tan(fovy/2)` convention (not independently cross-checked against a
+   rendered frame). The encoded camera is therefore a plausible stand-in,
+   not a faithful reproduction of Physion's actual render camera --
+   immaterial to stage 3 (state-based, no rendering involved) but relevant
+   to anyone using these GLBs for visual debugging.
+
+7. **No true ground/floor object at all.** TDW's room/level geometry
+   (floor, walls) is static level geometry, not a tracked rigid body --
+   it never appears in `static/object_ids` and has no per-frame pose. The
+   `zone` object (patient role) is a thin, per-trial-positioned flat marker
+   plate, empirically confirmed static (position/rotation bit-identical
+   across every frame checked) but **not** a stand-in for the floor (it
+   sits *on* the floor, at an arbitrary per-trial position/height).
+   Converted trials therefore carry **no ground-plane object whatsoever**
+   -- a real, load-bearing mismatch against `wm-scenes-v1`'s convention
+   (every episode has exactly one static ground box the dynamics model's
+   learned "ground" token was trained to attend against, per DESIGN.md's
+   V5 section); see docs/RESULTS.md's V8 section for how this plays out in
+   the dynamics-transfer numbers.
+
+8. **Discrete collision-event records dropped.** `frames/*/collisions/*`
+   and `frames/*/env_collisions/*` (contact points, per-event relative
+   velocity, discrete enter/stay/exit state strings) are real, richer
+   physics-engine output than gltfworld's transport has any channel for
+   (`RWM_state_series` carries continuous per-frame state, not discrete
+   events) -- not read or carried into the GLB at all. A real gap in the
+   *reverse* direction from most findings above: here it's gltfworld's
+   schema, not Physion's, that has nothing to receive the richer
+   information Physion actually offers.
+
+9. **One real positive finding (not a mismatch): velocities need no
+   finite-differencing.** Unlike a `wm-scenes-v1` episode that lacks a
+   velocity series, Physion's HDF5 tier writes real, simulator-native
+   per-frame `velocities`/`angular_velocities` directly -- gltfworld's
+   `RWM_state_series` channel for these is populated from genuine physics-
+   engine state, not a numerical approximation, for every converted trial.
+
+10. **Pixels dropped entirely, by design.** `frames/*/images/*` (rgb/seg/
+    depth/flow/normals -- also the overwhelming majority of each file's
+    bytes) is never read. Consistent with this milestone's state-based
+    scope (option (b) from the "V8 options" section above) and with a
+    pre-existing, more general observation: glTF itself has no
+    video-frame-sequence concept, so this isn't specific to Physion.
+
+11. **Variable per-trial object count (3, 5, or 7 in Collide alone,
+    `target`+`zone`+`probe` plus 0/1/2 distractor-occluder pairs).**
+    Not actually a problem for `InteractionTransformer` (permutation-
+    equivariant, no hardcoded `N_max` in the model itself -- only
+    `wm-scenes-v1`'s training-data *packer* padded to `N_max=5`, see
+    DESIGN.md's V4 section) but a real domain-gap dimension worth flagging
+    for stage 3: some other Physion scenarios (not Collide) go well beyond
+    `wm-scenes-v1`'s `N<=5` training distribution.
