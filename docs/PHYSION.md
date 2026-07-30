@@ -247,3 +247,117 @@ honest framing either way.
 
 None of (a)/(b)/(c) is implemented or started by this milestone; this
 section exists so V8 doesn't have to re-derive the tradeoffs from scratch.
+
+## V8 decision: option (b), state-based track (2026-07-30)
+
+V8 implements **option (b)**: bypass perception entirely, convert Physion's
+HDF5 ground-truth object state into gltfworld's own glTF transport, and run
+`gltfworld.models.dynamics.InteractionTransformer` (V5, `dynamics-v1`
+checkpoint) on the converted trials for the OCP task. This tests the
+*dynamics* model's zero-shot transfer, not perception's, and produces the
+"object states -> our glTF conversion experiment" DESIGN.md's V8 line
+anticipates.
+
+### Data acquired
+
+`Collide_testing_HDF5s.tar.gz` (the smallest rigid-scenario test tier,
+32.62 GiB per the table above -- verified again via a direct HTTP HEAD
+immediately before download: `Content-Length: 35026607691`, exact match),
+downloaded to `data/external/physion/hdf5/` and extracted to
+`data/external/physion/hdf5/extracted/Collide/` (both gitignored). The
+archive contains `Collide/hdf5s/` (150 per-trial `.hdf5` files, one per
+Collide test trial, matching Core's 150-trial count for this scenario) plus
+`Collide/hdf5s-redyellow/` (a mirrored 150 files -- appears to be the same
+per-trial structure with red/yellow-coded `_id` segmentation, not
+independently explored since this milestone's track needs no pixel data at
+all) and two scenario-level JSON summaries, `trial_labels.json`/
+`trial_labels_by_field.json` (150 entries each, keyed by `stimulus_name`,
+carrying `target_id`/`zone_id`/segmentation colors/`does_target_contact_zone`
+-- the same OCP outcome as Core's `labels.csv`, from inside the HDF5 tier
+itself; see "cross-check" below). `h5py>=3.10` added to the `sim` extra in
+`pyproject.toml` for this.
+
+### Physion HDF5 schema (verified against real files, `Collide/hdf5s/*.hdf5`)
+
+Each per-trial file has two top-level groups, `static` and `frames`. No
+`labels.csv`-style file lives inside an individual trial's HDF5 -- OCP
+ground truth is either the per-frame `target_contacting_zone` label (below)
+or the scenario-level `trial_labels.json` alongside the `hdf5s/` directory.
+
+**`static/`** (one entry per rigid body tracked in the whole trial, `N`
+objects, arrays in a fixed order shared across every `static/` dataset --
+verified index-consistent against `model_names`/`mesh/vertices_i`):
+
+| dataset | shape | dtype | meaning |
+| --- | --- | --- | --- |
+| `object_ids` | `(N,)` | int64 | stable per-trial object id (1-based; matches `frames/*/objects/*` row order and `target_id`/`zone_id`/`probe_id`) |
+| `model_names` | `(N,)` | object (bytes) | TDW asset name, e.g. `cube`, `cone`, `sphere`, `torus`, or a real furniture asset name for occluders/distractors (e.g. `linbrazil_diz_armchair`) |
+| `mass` | `(N,)` | float64 | kg |
+| `static_friction` / `dynamic_friction` | `(N,)` | float64 | **two** separate coefficients (`ObjectSpec.friction` only has one -- see conversion findings) |
+| `bounciness` | `(N,)` | float64 | restitution |
+| `scale` (+ `scale_x`/`scale_y`/`scale_z`) | `(N,3)` / `(N,)` | float32/float64 | per-axis scale applied to the unit mesh below |
+| `color` | `(N,3)` | float64 | RGB in `[0,1]` (no alpha) |
+| `object_segmentation_colors` | `(N,3)` | uint8 | instance-segmentation color, unrelated to the separate red/yellow OCP convention |
+| `initial_position` / `initial_rotation` | `(N,3)` / `(N,4)` | float32 | redundant with `frames/0000/objects/positions`/`rotations` |
+| `mesh/vertices_{i}` | `(V_i,3)` | float32 | **real per-object mesh geometry**, local unit space, index `i` = position in `object_ids` (0-based) |
+| `mesh/faces_{i}` | `(F_i,3)` | int32 | triangle indices into `vertices_i` (every file checked is already triangulated) |
+| `target_id` / `zone_id` / `probe_id` | scalar | int64 | which `object_ids` entry is the agent-to-be ("target", pushed into contact), the patient ("zone", a flat marker plane), and the launched impactor ("probe") -- see roles below |
+| `distractors` / `occluders` | `(k,)` | object (bytes) | **model names** (not ids) of decorative objects irrelevant to the OCP question |
+| `push_force` / `push_position` / `push_time` | `(3,)`/`(3,)`/scalar | float32/float32/int64 | the initial impulse applied to the probe |
+| `seed` / `trial_seed` / `trial_num` / `room` / `stimulus_name` / `git_commit` | scalar | various | provenance, matches the `trial_id` used elsewhere in this project |
+
+No `gravity` or `dt`/`framerate` field anywhere in `static/` -- see below.
+
+**`frames/{i:04d}/`** (one group per recorded frame, `i` zero-padded to 4
+digits; Collide trials are 151-152 frames, i.e. ~5.0-5.07s):
+
+| path | shape | dtype | meaning |
+| --- | --- | --- | --- |
+| `objects/positions` | `(N,3)` | float32 | world position of each object's *pivot* (not its geometric center -- TDW primitives are base-pivoted, `y in [0, height]` locally, not `[-height/2, height/2]`; see conversion findings) |
+| `objects/rotations` | `(N,4)` | float32 | quaternion, component order `(x,y,z,w)` -- verified empirically (not assumed): reproduces `objects/forwards` exactly via the standard right-handed quaternion-rotate formula applied to the raw, unmodified coordinates (see conversion findings for the handedness caveat this glosses over) |
+| `objects/velocities` / `angular_velocities` | `(N,3)` | float32 | **real, simulator-native per-frame velocities** -- no finite-differencing needed (unlike `wm-scenes-v1` episodes without a `lin_vel`/`ang_vel` series) |
+| `objects/forwards`/`front`/`back`/`top`/`bottom`/`left`/`right` | `(N,3)` | float32 | world-space points on the object's oriented bounding box (face centers) plus the forward direction; not used by this milestone's conversion (real mesh + `positions`/`rotations` already fully determine these) |
+| `objects/center` | `(N,3)` | float32 | world-space true geometric center (vs. `positions`' pivot) |
+| `camera_matrices/camera_matrix` | `(16,)` | float32 | row-major 4x4 world-to-camera view matrix; **fixed for the whole trial** (verified bit-identical frame 0 vs. frame 50); rotation block has **determinant -1** under a naive right-handed read (see conversion findings) |
+| `camera_matrices/projection_matrix` | `(16,)` | float32 | row-major 4x4; `[1,1] = 1.9209819` -> a ~59.6 degree vertical FOV under the standard `1/tan(fovy/2)` OpenGL convention |
+| `collisions/*`, `env_collisions/*` | varies | float32/int32/int64/`\|S1` | discrete contact-event records (object-object and object-environment); not carried into the glTF conversion (continuous per-frame state is; see findings) |
+| `images/_img`, `_id`, `_depth`, `_flow`, `_normals` | varies (compressed byte streams, `_depth` raw `(512,512,3)` uint8) | uint8 | rendered pixel data -- **not read at all** by this milestone (state-based track, no pixels needed; also the overwhelming majority of each file's size) |
+| `labels/target_contacting_zone` | scalar | bool | **the actual OCP signal, computed by the simulator itself, per frame** -- the trial-level OCP label is `any(target_contacting_zone across all frames)` |
+| `labels/has_target`/`has_zone`/`target_has_moved`/`target_on_ground`/`target_delta_position`/`trial_end`/`trial_complete`/`trial_timeout` | scalar/`(3,)` | bool/float32 | auxiliary simulator bookkeeping, not otherwise used here |
+
+**Roles** (agent/patient framing from the top of this doc, in this HDF5's
+own vocabulary): `target_id` = **agent** (red in `mp4s-redyellow`; the object
+that might touch the zone), `zone_id` = **patient** (yellow; a flat marker
+region, empirically static -- see findings), `probe_id` = the launched
+impactor that starts the chain reaction (not specially colored in
+`mp4s-redyellow`, per `trial_labels.json`'s `target_segmentation_color`/
+`zone_segmentation_color` fields only ever naming target+zone). Any
+remaining `object_ids` not in `{target_id, zone_id, probe_id}` are
+distractors/occluders (by `model_names` membership in `static/distractors`/
+`static/occluders`).
+
+**Cross-check**: `trial_labels.json`'s `does_target_contact_zone` is used
+directly as this milestone's OCP ground truth (matches Core's `labels.csv`
+by construction -- same benchmark, same 150 Collide trials; not
+independently re-diffed row-by-row here since `trial_labels.json` lives
+inside the exact tier this milestone downloads, one join away from Core's
+labels.csv, and is more convenient -- keyed by `stimulus_name`, no
+`_img`-suffix stripping needed).
+
+**`dt` is not stored anywhere in the file.** Inferred as **1/30 s**: (a)
+Collide trials run 151-152 frames, i.e. 5.03-5.07s at 1/30s/frame, matching
+docs' own "5-19s" duration range for the *shortest* scenario; (b) a direct
+per-frame finite-difference check (`dpos` vs `v_avg * dt`) does *not*
+reproduce 1/30s cleanly (order 0.009-0.014s instead) -- but this is expected,
+not contradictory: like `wm-scenes-v1`'s own generator (500 Hz internal,
+~30 Hz recorded, see DESIGN.md), TDW's underlying physics almost certainly
+substeps faster than the recorded-frame rate, so naive single-step
+finite-differencing of *recorded* frames doesn't recover the *true* internal
+integrator step. `dt=1/30` is what this milestone uses for every downstream
+per-recorded-frame computation (the same semantics `wm-scenes-v1`'s
+`scene.dt`/`series.times` already use).
+
+**Gravity is not stored anywhere in the file either.** Used as TDW/Unity's
+documented default, `(0, -9.81, 0)` -- an assumption, not independently
+re-derived per trial (a direct finite-difference re-derivation was tried and
+rejected as unreliable for the same substep reason as `dt` above).
