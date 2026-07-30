@@ -203,6 +203,20 @@ def _role_for_object(object_id: int, model_name: str, static: h5py.Group) -> str
     return ROLE_OBJECT
 
 
+def quat_rotate_points(quat: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Rotate ``points (V,3)`` by a single quaternion ``quat (4,)`` xyzw, the
+    standard right-handed quaternion-rotate formula -- verified (see
+    docs/PHYSION.md's schema section) to reproduce HDF5's own ``forwards``
+    dataset exactly when applied to the raw, unmodified per-frame data, so
+    this is the correct formula for *this* (left-handed, but internally
+    self-consistent, see conversion findings) coordinate convention too."""
+    q = np.asarray(quat, dtype=np.float64)
+    v = np.asarray(points, dtype=np.float64)
+    qv = q[:3]
+    t = 2.0 * np.cross(qv, v)
+    return v + q[3] * t + np.cross(qv, t)
+
+
 def _look_at_quat(eye: np.ndarray, target: np.ndarray, world_up: np.ndarray = np.array([0.0, 1.0, 0.0])) -> np.ndarray:
     """Right-handed look-at quaternion (xyzw), glTF/OpenGL camera convention
     (looks down local -Z, up is local +Y). See docs/PHYSION.md findings for
@@ -329,10 +343,34 @@ def load_trial(hdf5_path: str | Path) -> PhysionTrial:
 
         objects: list[PhysionObject] = []
         for i, object_id in enumerate(object_ids):
-            vertices_local = np.asarray(static["mesh"][f"vertices_{i}"][()], dtype=np.float32) * scale[i]
-            faces = np.asarray(static["mesh"][f"faces_{i}"][()], dtype=np.uint32)
-            if faces.shape[1] != 3:
-                raise ValueError(f"{hdf5_path}: object {object_id} faces not triangulated: {faces.shape}")
+            raw_vertices = np.asarray(static["mesh"][f"vertices_{i}"][()], dtype=np.float32)
+            raw_faces = np.asarray(static["mesh"][f"faces_{i}"][()], dtype=np.uint32)
+            if raw_vertices.shape[0] == 0:
+                # Some decorative occluder/distractor assets (real-world
+                # furniture/animal models, e.g. "amphora_jar_vase",
+                # "648972_chair_poliform_harmony", "shar_pei") have an
+                # *empty* mesh in this HDF5 tier -- TDW's mesh-export step
+                # evidently can't (or doesn't) dump geometry for every asset
+                # kind, even though the object is fully tracked otherwise
+                # (position/rotation/scale all present). Never true for
+                # target/zone/probe in any trial checked (always a simple
+                # primitive: cube/cone/sphere/torus/dumbbell/...), so this
+                # never touches the OCP-relevant geometry -- a placeholder
+                # unit box (scaled like a real object would be) stands in,
+                # purely so the trial still converts to a complete, valid
+                # GLB. See docs/PHYSION.md conversion findings.
+                from gltfworld.scene.primitives import mesh_for
+
+                placeholder_positions, _, placeholder_indices = mesh_for(
+                    "box", np.array([0.5, 0.5, 0.5], dtype=np.float32)
+                )
+                vertices_local = placeholder_positions * scale[i]
+                faces = placeholder_indices.reshape(-1, 3).astype(np.uint32)
+            else:
+                vertices_local = raw_vertices * scale[i]
+                faces = raw_faces
+                if faces.shape[1] != 3:
+                    raise ValueError(f"{hdf5_path}: object {object_id} faces not triangulated: {faces.shape}")
 
             positions_i = np.ascontiguousarray(all_positions[:, i, :])
             rotations_i = np.ascontiguousarray(all_rotations[:, i, :])
@@ -345,15 +383,30 @@ def load_trial(hdf5_path: str | Path) -> PhysionTrial:
             model_name = model_names[i]
             role = _role_for_object(object_id, model_name, static)
 
+            # Distractors/occluders are only ever visual decoration, never a
+            # real interactive rigid body: verified empirically (see
+            # docs/PHYSION.md findings) that every such object is static
+            # (zero pose change across the whole trial) *and* that TDW's own
+            # static/mass|static_friction|dynamic_friction|bounciness arrays
+            # are truncated to just the physically-relevant objects
+            # (target/zone/probe) -- shorter than object_ids/model_names/
+            # scale/color/mesh, which cover every object. Any index beyond
+            # that truncated length gets a placeholder (mass/friction/
+            # restitution are physically inert for a static body anyway --
+            # KHR_physics_rigid_bodies omits "motion" for static bodies, see
+            # gltfworld.ext.khr_physics), not a real measured value.
+            has_physics_metadata = i < len(mass)
             objects.append(
                 PhysionObject(
                     object_id=object_id,
                     model_name=model_name,
                     role=role,
                     is_static=is_static,
-                    mass=float(mass[i]),
-                    friction=float((static_friction[i] + dynamic_friction[i]) / 2.0),
-                    restitution=float(bounciness[i]),
+                    mass=float(mass[i]) if has_physics_metadata else 1.0,
+                    friction=(
+                        float((static_friction[i] + dynamic_friction[i]) / 2.0) if has_physics_metadata else 0.5
+                    ),
+                    restitution=float(bounciness[i]) if has_physics_metadata else 0.0,
                     color=np.array([color[i, 0], color[i, 1], color[i, 2], 1.0], dtype=np.float32),
                     vertices=vertices_local,
                     faces=faces,

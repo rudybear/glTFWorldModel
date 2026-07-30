@@ -516,3 +516,44 @@ physics metadata round-trip through the *existing*, unmodified
     DESIGN.md's V4 section) but a real domain-gap dimension worth flagging
     for stage 3: some other Physion scenarios (not Collide) go well beyond
     `wm-scenes-v1`'s `N<=5` training distribution.
+
+Three more findings, hit only once every one of the 150 Collide test trials
+was actually converted (not just the first 3):
+
+12. **Distractor/occluder objects have no physics metadata at all.**
+    `static/mass`/`static_friction`/`dynamic_friction`/`bounciness` are only
+    ever as long as the physically-relevant object count
+    (`target`+`zone`+`probe` -- always 3), *not* the full `object_ids`
+    length (5 or 7 when distractors/occluders are present -- 23 trials have
+    3 objects, 64 have 5, 63 have 7, across the full 150). Verified this is
+    benign, not silently wrong: every such object is also empirically static
+    (zero pose change across every frame checked, same test as the finding
+    on `zone` above), so a placeholder mass/friction/restitution (documented
+    in code, `convert.py`) is physically inert -- `KHR_physics_rigid_bodies`
+    omits `motion` for a static body regardless of what its mass field says.
+13. **Some occluder/distractor real-world asset meshes are simply empty.**
+    13 model names (`amphora_jar_vase`, `648972_chair_poliform_harmony`,
+    `shar_pei`, `animal_dog_rtsit_1280`, ...) have `static/mesh/vertices_i`
+    with **zero rows** in every trial that uses them -- TDW's mesh-export
+    step evidently can't (or doesn't) dump geometry for every asset kind,
+    even though the object is fully tracked (position/rotation/scale) like
+    any other. `gltfworld.physion.convert.load_trial` substitutes a
+    placeholder unit box (scaled like the real object would be) so the
+    trial still converts to a complete, valid GLB -- never affects the
+    OCP-relevant geometry (never `target`/`zone`/`probe` in any of the 150
+    trials checked).
+14. **Real Physion model names don't fit gltfworld's own tensor-contract
+    category vocabulary.** `gltfworld.scene.contract.episode_to_tensors`
+    (built for `wm-scenes-v1`'s `{"ball", "crate", "cylinder"}` world) raises
+    on any other `ObjectSpec.category` string -- real Physion names like
+    `"cone"`, `"torus"`, `"648972_chair_poliform_harmony"` all fail it.
+    Stage 3 (`gltfworld.physion.ocp_eval`) works around this with a
+    shape-based remap (sphere -> ball, box -> crate) applied to a throwaway
+    copy of the decoded `Episode` used only for the tensor-contract call --
+    the GLB's own `extras.rwm.category` (the real model name) is never
+    touched. `class_ids` (the only thing this remap affects) isn't consumed
+    by the dynamics model at all (only `shape_onehot` is), so this is a
+    zero-cost workaround for a real, narrower-than-it-looks contract
+    assumption -- worth fixing generally (accept an arbitrary category
+    string, or make `class_ids` optional) if gltfworld's tensor contract is
+    ever extended beyond `wm-scenes-v1`.
