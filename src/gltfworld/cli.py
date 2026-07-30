@@ -115,10 +115,20 @@ def _cmd_inspect(path: str) -> int:
             ("ang_vel", series.ang_vel is not None),
             ("actions", series.actions is not None),
             ("pose_var", series.pose_var is not None),
+            ("joint_pos", series.joint_pos is not None),
         )
         if present
     ]
     print(f"optional channels: {', '.join(channels) if channels else '(none)'}")
+
+    if scene.articulations:
+        print(f"articulations: {len(scene.articulations)}")
+        for art in scene.articulations:
+            print(
+                f"  - joint {art.joint_index}: {art.joint_type} base={art.base_object_id} "
+                f"part={art.part_object_id} axis={art.axis} range=[{art.min:.4g}, {art.max:.4g}] "
+                f"handle={art.handle_object_id}"
+            )
 
     import pygltflib
 

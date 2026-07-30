@@ -130,6 +130,77 @@ class LightSpec:
             raise ValueError("point light requires position")
 
 
+JOINT_TYPES = ("revolute", "prismatic")
+
+
+@dataclass
+class ArticulatedSpec:
+    """One articulated assembly: a static ``base`` body + a moving ``part``
+    body connected by a single-DOF joint, plus an optional cosmetic
+    ``handle`` that moves rigidly with ``part`` (see
+    ``gltfworld.datagen.articulated`` for the MJCF/MuJoCo side and
+    ``gltfworld.ext.khr_physics`` for the ``KHR_physics_rigid_bodies`` joint
+    encoding).
+
+    ``joint_index`` is this articulation's column index into
+    ``StateSeries.joint_pos`` (T, J) and its index into the encoded
+    ``KHR_physics_rigid_bodies.physicsJoints`` array -- both share the same
+    ordering as ``SceneState.articulations``.
+
+    **wm-articulated-v1 simplifying convention** (documented, not a
+    limitation of ``KHR_physics_rigid_bodies`` itself, which supports
+    arbitrary joint-local axes): ``base`` and ``part`` are both authored at
+    identity world orientation, and ``axis`` indexes a *world*-aligned
+    X/Y/Z axis at rest -- so gltfworld doesn't need to track a separate
+    joint-local basis rotation. ``anchor`` is the world position, at t=0,
+    of the physical hinge line (revolute) or the slide-axis reference point
+    (prismatic). ``base``'s and ``part``'s own object nodes keep their
+    ordinary, shape-centered mesh/collider convention unchanged; a pair of
+    dedicated, geometry-less "joint pivot" child nodes (nested one under
+    each of ``base``/``part``, see ``gltfworld.scene.convert``'s
+    articulation encoding) are placed at ``anchor`` instead, which is what
+    makes the KHR joint's zero-distance attachment-frame construction (the
+    pinned spec's own worked hinge example -- see DESIGN.md) exactly
+    correct rather than an approximation.
+
+    ``min``/``max`` are radians (revolute) or meters (prismatic), matching
+    ``KHR_physics_rigid_bodies.joint.limit``'s own units.
+    """
+
+    joint_index: int
+    base_object_id: int
+    part_object_id: int
+    joint_type: str
+    axis: int  # 0=X, 1=Y, 2=Z (world-aligned at rest -- see docstring)
+    min: float
+    max: float
+    anchor: np.ndarray  # (3,) float32, world position at t=0
+    part_labels: tuple[str, ...] = ()
+    affordances: tuple[str, ...] = ()
+    handle_object_id: int | None = None
+    handle_labels: tuple[str, ...] = ()
+    handle_affordances: tuple[str, ...] = ()
+    base_labels: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.joint_type not in JOINT_TYPES:
+            raise ValueError(f"unknown joint_type {self.joint_type!r}, expected one of {JOINT_TYPES}")
+        if self.axis not in (0, 1, 2):
+            raise ValueError(f"axis must be 0 (X), 1 (Y), or 2 (Z), got {self.axis!r}")
+        self.joint_index = int(self.joint_index)
+        self.base_object_id = int(self.base_object_id)
+        self.part_object_id = int(self.part_object_id)
+        self.min = _f32_scalar(self.min)
+        self.max = _f32_scalar(self.max)
+        self.anchor = _f32(self.anchor, (3,))
+        self.part_labels = tuple(str(v) for v in self.part_labels)
+        self.affordances = tuple(str(v) for v in self.affordances)
+        self.handle_object_id = None if self.handle_object_id is None else int(self.handle_object_id)
+        self.handle_labels = tuple(str(v) for v in self.handle_labels)
+        self.handle_affordances = tuple(str(v) for v in self.handle_affordances)
+        self.base_labels = tuple(str(v) for v in self.base_labels)
+
+
 @dataclass
 class SceneState:
     """The static content of one episode: objects, camera, lights, physics constants."""
@@ -141,6 +212,7 @@ class SceneState:
     dt: float
     seed: int
     scene_version: str = "wm-scenes-v1"
+    articulations: list[ArticulatedSpec] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.gravity = _f32(self.gravity, (3,))

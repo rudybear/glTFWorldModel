@@ -28,7 +28,7 @@
             "description": "One time-series channel: a (count == len(times)) accessor of up to 4 feature dims, tied to a node or the whole episode.",
             "properties": {
                 "target": {
-                    "description": "The node this channel applies to, or \"world\" for episode-wide channels (e.g. actions).",
+                    "description": "The node this channel applies to, the KHR_physics_rigid_bodies physicsJoints[] index this channel applies to (joint_position only), or \"world\" for episode-wide channels (e.g. actions).",
                     "oneOf": [
                         {
                             "type": "object",
@@ -36,6 +36,14 @@
                                 "node": { "type": "integer", "minimum": 0 }
                             },
                             "required": ["node"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "joint": { "type": "integer", "minimum": 0 }
+                            },
+                            "required": ["joint"],
                             "additionalProperties": false
                         },
                         { "const": "world" }
@@ -46,7 +54,8 @@
                         "linear_velocity",
                         "angular_velocity",
                         "action",
-                        "pose_variance"
+                        "pose_variance",
+                        "joint_position"
                     ]
                 },
                 "accessor": {

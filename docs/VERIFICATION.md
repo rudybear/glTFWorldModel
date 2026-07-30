@@ -1508,3 +1508,134 @@ accounting is `acbd2f1` (V8-prep: ingest + format reconnaissance),
 `dda5673` (the `v8-physion-ingest` merge), `05dc6df`/`f28e76c`/`e00f559`
 (the three numbered V8 stage commits), and `baa02a1` (the final V8
 commit). This V8.1 fix commit is a 7th.
+
+## V9-prep -- articulated objects: KHR joints, MJCF door/drawer, physics sanity
+
+Needs the `sim` extra (`tests/test_articulated_physics.py`, the only
+MuJoCo-backed file this milestone added -- everything else is pure
+dataclasses + the existing glTF codec, no new dependency). Developed and
+verified CPU-only (no GPU/EGL context, no renderer, no training) per this
+milestone's own scope; nothing here is `@pytest.mark.gpu`-marked. See
+DESIGN.md's "Articulated objects (V9-prep)" section for the full
+architecture/mapping writeup this section verifies against.
+
+### Checkpoint: KHR joint codec, vendored-schema validation
+
+- **Purpose**: confirm `gltfworld.ext.khr_physics`'s new joint builders
+  (`hinge_joint_limits`/`slider_joint_limits`/`build_joint_dict`/
+  `node_joint_property`) produce exactly the pinned spec's own worked hinge
+  example (3D linear @ 0, 1D angular swing, 2D angular @ 0) and its
+  translation/rotation-swapped slider analog, and that every produced dict
+  validates against the vendored (already present since V1, see
+  `docs/schemas/khr/PROVENANCE.md`) joint schemas; confirms a
+  `KhrPhysicsDocument` round-trips `joints`/node `joint` properties through
+  a raw write -> read cycle; confirms the schema's own
+  `oneOf(linearAxes, angularAxes)` constraint genuinely rejects a
+  malformed limit (not vacuously satisfied).
+- **Command**: `uv run pytest tests/test_khr_joints.py -v`
+- **Expected result**: all 7 tests pass.
+
+### Checkpoint: articulated scene model + transport round trip
+
+- **Purpose**: confirm `ArticulatedSpec`/`SceneState.articulations`/
+  `StateSeries.joint_pos` validate their own invariants (bad joint type/
+  axis rejected, joint-count-vs-`articulations`-length mismatch rejected,
+  `joint_pos` shape validated); confirm a hand-built articulated `Episode`
+  (a door hinge, no MuJoCo needed) round-trips bit-for-bit both in-memory
+  and through a real `.glb` file (`ArticulatedSpec` fields, `joint_pos`,
+  `poses`); confirm `extras.rwm.semantics` is present (with the right
+  labels/affordances) for base/part/handle nodes and *absent* both for the
+  ground node in the same episode and for every node in a non-articulated
+  episode (backward compatibility -- a pre-V9-prep episode's `extras.rwm`
+  is byte-for-byte unaffected); confirm the two new joint-pivot child nodes
+  are correctly excluded from `scenes[0].nodes` (nested via `node.children`
+  instead) while a non-articulated episode's root list is completely
+  unchanged; confirm the encoded `physicsJoints[]`/node `joint`
+  property/`RWM_state_series` `joint_position` channel all validate against
+  their vendored schemas; confirm the part-pivot node's `joint.connectedNode`
+  genuinely points at the base-pivot node (not just "some" valid index).
+- **Command**: `uv run pytest tests/test_articulated_scene.py -v`
+- **Expected result**: all 15 tests pass.
+
+### Checkpoint: real glTF-Validator, articulated sample
+
+- **Purpose**: confirm a sample articulated GLB (pivot nodes, KHR joints,
+  `joint_position` channel, semantics extras) is spec-valid glTF per the
+  independent, pinned Khronos glTF-Validator, not just internally
+  self-consistent -- same acceptance bar as every other milestone's
+  transport output.
+- **Command**: `uv run pytest tests/test_articulated_scene.py -v -k validates_clean`
+  (skipped only if neither a cached validator binary nor network access is
+  available, same as `tests/test_validator.py`)
+- **Expected result**: passes; `numErrors == 0`, only `UNSUPPORTED_EXTENSION`
+  info-level messages (the validator doesn't know about the draft/custom
+  extensions), exactly as every other milestone's samples.
+
+### Checkpoint: physics sanity -- door opens, drawer slides, both settle within limits
+
+- **Purpose**: confirm a scripted "push" (a bounded-duration generalized
+  force/torque, not a permanently-active motor -- see DESIGN.md's honest
+  gap on `joint.drive`) applied to a freshly-simulated door/drawer produces
+  real opening/sliding dynamics: the door's `joint_pos` rises monotonically
+  (small numerical tolerance) up to its peak and settles (low variance) by
+  the end of the episode, within its joint limits (small, documented
+  soft-constraint tolerance); the drawer's `joint_pos` stays within its
+  travel range throughout and shows genuine net displacement (not a no-op).
+  `axis` is pinned to the gravity-decoupled case for each (vertical hinge
+  for the door, horizontal slide for the drawer) -- see DESIGN.md's
+  "gravity coupling" finding for why other axis choices are physically
+  valid but not asserted monotonic here.
+- **Command**: `uv run pytest tests/test_articulated_physics.py -v -k "opens_and_settles or slides_within_travel"`
+- **Expected result**: all 15 tests pass (5 seeds x door, 5 seeds x 2
+  drawer slide axes), across a 5-second (150-frame @ 30Hz) recorded window.
+
+### Checkpoint: THE articulation consistency check
+
+- **Purpose**: confirm the moving part's recorded pose equals the anchor
+  point composed with the joint transform implied by the recorded
+  `joint_pos`, at every step -- reconstructed purely from `ArticulatedSpec`
+  metadata plus the recorded `poses`/`joint_pos` (no privileged access to
+  MuJoCo's internal state), both for a freshly-simulated in-memory
+  `Episode` and after a real save/load `.glb` round trip (mirroring
+  `tests/test_provenance.py`'s pattern) -- **this is the core "the part's
+  pose actually is base pose composed with the joint transform" invariant**
+  the milestone spec calls for.
+- **Command**: `uv run pytest tests/test_articulated_physics.py -v -k articulation_consistency`
+- **Expected result**: all 12 tests pass (5 seeds x {door, drawer} in-memory
+  + 2 post-round-trip). Observed worst-case error across the full sweep:
+  **0.0077m position, 0.014 quaternion-component rotation** (cross-checked
+  against an independent `scipy.spatial.transform.Rotation` implementation
+  of the identical formula) -- both comfortably inside the tests' 0.03/0.03
+  tolerance, which itself was set with margin above this measured bound, not
+  tuned to pass. See DESIGN.md for why this small residual (concentrated
+  mid-transient, ~0 at rest) is judged a benign MuJoCo reporting artifact
+  rather than a wrong formula.
+
+### Checkpoint: full test suite
+
+- **Purpose**: confirm this milestone didn't regress anything upstream and
+  that everything new is exercised, CPU-only.
+- **Command**: `uv run pytest -v -m "not gpu"`
+- **Expected result / observed**: **265 passed, 14 deselected** -- up from
+  the pre-V9-prep baseline of **216 passed, 14 deselected** on the same
+  commit this branch forked from (measured directly, `git stash -u` +
+  re-run), i.e. this milestone added exactly **49** new, non-gpu-marked
+  tests and deselected/skipped nothing differently. `uv run pytest -v`
+  (full, gpu tests included) was **not** run as part of this milestone, per
+  its own CPU-only scope (a GPU training run was in progress).
+
+### Checkpoint: honest gaps documented
+
+- **Purpose**: confirm the gaps this milestone's design necessarily leaves
+  (feeding the full V9 gap report, not a substitute for it) are recorded
+  plainly rather than glossed over.
+- **Command**: see DESIGN.md's "Honest gaps (feeding the full V9 gap
+  report)" subsection.
+- **Expected result**: four gaps recorded -- `joint.limit`'s
+  stiffness/damping being soft-stop-only (no viscous joint damping/armature
+  equivalent), `joint.drive` being unusable for a bounded-duration push
+  (persistent spring-to-target only), the handle's rigid attachment not
+  being KHR-joint/weld-encoded (derived pose only), and
+  `KHR_implicit_shapes` having no collider offset/center field (the actual
+  reason the joint-pivot-child-node design was needed instead of moving
+  object origins to the hinge point).

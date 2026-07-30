@@ -30,6 +30,55 @@ for ``ObjectSpec`` round-tripping, so ``gltfworld.ext.rwm`` additionally
 stashes ``mass``/``is_static`` in ``extras.rwm`` per node as the source of
 truth for decode; ``KHR_physics_rigid_bodies`` remains a faithful,
 schema-valid encoding of the draft extension in its own right.
+
+V9-prep: joints
+----------------
+
+Also modeled (added for V9-prep, articulated objects): root-level
+``KHR_physics_rigid_bodies.physicsJoints[]`` (each a set of ``limits``, per
+``glTF.KHR_physics_rigid_bodies.joint.schema.json``/``...joint.limit...``)
+and the per-node ``joint`` property (``node.KHR_physics_rigid_bodies.joint``:
+``connectedNode`` + ``joint`` index + ``enableCollision``), against the
+*same* pinned commit's already-vendored joint schemas (they were fetched
+alongside the rest of ``physics_rigid_bodies/schema/*.json`` back in V1 --
+see ``docs/schemas/khr/PROVENANCE.md`` -- nothing new to vendor).
+
+Per the pinned spec text (``eoineoineoin/glTF_Physics`` README, "Joints"
+section): a joint's two attachment frames are each defined by "the relative
+transform between the node and the first parent motion (or the simulation's
+fixed reference frame, if no such motion exists)". gltfworld's articulated
+objects are flat, top-level nodes (no scene-graph nesting under a common
+parent, matching every other gltfworld object) with **dedicated,
+motion-less, geometry-less child "joint pivot" nodes** nested one level
+under each of ``base``/``part`` (see ``gltfworld.scene.convert``): the
+part-side pivot's ancestor-with-motion is the part's own rigid-body node, so
+its attachment frame is exactly its fixed local offset within that body
+(correctly co-moving as the body's ``motion`` state changes); the base-side
+pivot's nearest ancestor has no ``motion`` (base is static), so its
+attachment frame is exactly its fixed offset from the world origin. Both
+pivots are placed at ``ArticulatedSpec.anchor`` (the shared joint anchor
+point, in each body's *own* local frame) with identity local rotation
+(gltfworld's articulated scenes keep ``base``/``part`` world-aligned at
+rest, see ``ArticulatedSpec``'s docstring), which is exactly what makes a
+**hinge** = "3D linear limit, min=max=0" + "1D angular limit about the hinge
+axis" + "2D angular limit, min=max=0 about the other two axes" (the pinned
+spec's own worked example) and a **slider** = the same pattern with
+linear/angular swapped, both literally correct (not approximate) per
+:func:`hinge_joint_limits`/:func:`slider_joint_limits`.
+
+Honest gap (see DESIGN.md's V9-prep gap notes): ``joint.limit`` only carries
+``stiffness``/``damping`` for the *restorative* force applied once a limit
+is exceeded (a soft stop), not a viscous damping coefficient active across
+the whole free range the way MJCF/URDF joint ``damping`` (or ``armature``)
+is -- there is no way to express "this hinge always has some viscous drag
+while swinging, even within its limits" in this pinned commit's joint
+schema. Likewise ``joint.drive`` models a persistent, always-on
+spring-to-target (position/velocity), not a *finite-duration* external push
+impulse -- gltfworld's MJCF "scripted push" actuation (see
+``gltfworld.datagen.articulated``) is therefore not encoded as a KHR
+``drive`` at all (it would misrepresent a one-shot push as a permanently
+active motor); the driving force only exists inside the MuJoCo simulation
+that produced the recorded ``poses``/``joint_pos`` trajectory.
 """
 
 from __future__ import annotations
@@ -98,6 +147,8 @@ class KhrPhysicsDocument:
     physics_materials: list[dict[str, Any]] = field(default_factory=list)
     # node index -> raw KHR_physics_rigid_bodies node-extension dict
     node_physics: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # root-level physicsJoints[] (V9-prep)
+    joints: list[dict[str, Any]] = field(default_factory=list)
 
 
 def build_khr_physics(
@@ -162,6 +213,9 @@ def write_khr_physics(gltf: pygltflib.GLTF2, doc: KhrPhysicsDocument) -> None:
     if doc.physics_materials:
         gltf.extensions.setdefault(EXT_RIGID_BODIES, {})
         gltf.extensions[EXT_RIGID_BODIES]["physicsMaterials"] = doc.physics_materials
+    if doc.joints:
+        gltf.extensions.setdefault(EXT_RIGID_BODIES, {})
+        gltf.extensions[EXT_RIGID_BODIES]["physicsJoints"] = doc.joints
 
     for node_index, node_physics in doc.node_physics.items():
         node = gltf.nodes[node_index]
@@ -177,6 +231,7 @@ def read_khr_physics(gltf: pygltflib.GLTF2) -> KhrPhysicsDocument:
     """Read back the raw KHR physics dicts from ``gltf``."""
     shapes = list(gltf.extensions.get(EXT_IMPLICIT_SHAPES, {}).get("shapes", []))
     physics_materials = list(gltf.extensions.get(EXT_RIGID_BODIES, {}).get("physicsMaterials", []))
+    joints = list(gltf.extensions.get(EXT_RIGID_BODIES, {}).get("physicsJoints", []))
 
     node_physics: dict[int, dict[str, Any]] = {}
     for index, node in enumerate(gltf.nodes):
@@ -184,7 +239,9 @@ def read_khr_physics(gltf: pygltflib.GLTF2) -> KhrPhysicsDocument:
         if EXT_RIGID_BODIES in extensions:
             node_physics[index] = extensions[EXT_RIGID_BODIES]
 
-    return KhrPhysicsDocument(shapes=shapes, physics_materials=physics_materials, node_physics=node_physics)
+    return KhrPhysicsDocument(
+        shapes=shapes, physics_materials=physics_materials, node_physics=node_physics, joints=joints
+    )
 
 
 def shape_to_object_size(shape_dict: dict[str, Any]) -> tuple[str, np.ndarray]:
@@ -235,3 +292,65 @@ def node_motion_velocities(node_physics: dict[str, Any]) -> tuple[np.ndarray | N
     lin_arr = np.array(lin, dtype=np.float32) if lin is not None else None
     ang_arr = np.array(ang, dtype=np.float32) if ang is not None else None
     return lin_arr, ang_arr
+
+
+# --- V9-prep: joints ------------------------------------------------------------
+#
+# See the module docstring's "V9-prep: joints" section for why the limit
+# shapes below (3D + 1D, or 3D + 2D) are exactly the pinned spec's own
+# worked hinge example, not an invented approximation.
+
+_ALL_AXES = (0, 1, 2)
+
+
+def hinge_joint_limits(axis: int, min_rad: float, max_rad: float) -> list[dict[str, Any]]:
+    """Limits for a revolute (hinge) joint swinging about local axis ``axis``
+    (0=X, 1=Y, 2=Z), within ``[min_rad, max_rad]`` radians.
+
+    Exactly the pinned spec README's own worked example: "a hinged door can
+    be constructed by locating the attachment frames at the point where the
+    physical hinge would be on each body, adding a 3D linear limit with zero
+    maximum distance, a 1D angular limit with min/max describing the swing
+    of the door around it's vertical axis, and a 2D angular limit with zero
+    limits about the remaining two axes."
+    """
+    other_axes = [a for a in _ALL_AXES if a != axis]
+    return [
+        {"linearAxes": list(_ALL_AXES), "min": 0.0, "max": 0.0},
+        {"angularAxes": other_axes, "min": 0.0, "max": 0.0},
+        {"angularAxes": [axis], "min": float(min_rad), "max": float(max_rad)},
+    ]
+
+
+def slider_joint_limits(axis: int, min_m: float, max_m: float) -> list[dict[str, Any]]:
+    """Limits for a prismatic (slider) joint translating along local axis
+    ``axis`` (0=X, 1=Y, 2=Z), within ``[min_m, max_m]`` meters.
+
+    The natural translation/rotation-swapped analog of
+    :func:`hinge_joint_limits`'s spec-given hinge construction (not itself
+    spelled out verbatim in the pinned spec text, but a direct application
+    of the same limit-composition primitives it describes): lock all
+    rotation (3D angular limit at zero), lock translation on the two
+    off-axis directions (2D linear limit at zero), and constrain the slide
+    axis to ``[min_m, max_m]`` (1D linear limit).
+    """
+    other_axes = [a for a in _ALL_AXES if a != axis]
+    return [
+        {"angularAxes": list(_ALL_AXES), "min": 0.0, "max": 0.0},
+        {"linearAxes": other_axes, "min": 0.0, "max": 0.0},
+        {"linearAxes": [axis], "min": float(min_m), "max": float(max_m)},
+    ]
+
+
+def build_joint_dict(limits: list[dict[str, Any]]) -> dict[str, Any]:
+    """A root-level ``physicsJoints[]`` entry (``glTF.KHR_physics_rigid_bodies.joint``)."""
+    return {"limits": limits}
+
+
+def node_joint_property(connected_node: int, joint_index: int, enable_collision: bool = False) -> dict[str, Any]:
+    """A node's ``joint`` property (``node.KHR_physics_rigid_bodies.joint``)."""
+    return {
+        "connectedNode": int(connected_node),
+        "joint": int(joint_index),
+        "enableCollision": bool(enable_collision),
+    }

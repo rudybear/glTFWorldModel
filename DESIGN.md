@@ -503,6 +503,10 @@ model milestone lined up, so dynamics moved first.
   reported honestly. See `docs/PHYSION.md` (schema, decision, conversion
   findings) and `docs/RESULTS.md`/`docs/VERIFICATION.md`'s V8 sections.
 - **V9** — gap report + RWM extension write-up; PoC evaluation wrap-up.
+  **Prep landed** (KHR joints codec, articulated door/drawer transport,
+  joint state channel, physics-sanity + articulation-consistency tests --
+  see "Articulated objects (V9-prep)" below and `docs/VERIFICATION.md`'s
+  V9-prep section); the full gap report/write-up itself remains open.
 
 ## Dataset build (V4)
 
@@ -1509,3 +1513,265 @@ orchestrator's to run with the eventual `perception-v4-cnn-40k` checkpoint,
 per this milestone's own scope boundary (deliver + smoke-test the closed
 loop here, same precedent V5/V6 established for their own full training/eval
 runs).
+
+## Articulated objects (V9-prep)
+
+Brings articulated objects (a cabinet with a hinged door, a chest/table with
+a sliding drawer -- each with a handle) into the transport, using the draft
+`KHR_physics_rigid_bodies` **joint** machinery (revolute via a limited
+rotational DOF, prismatic via a limited linear DOF). This is prep work for
+the full V9 milestone ("gap report + RWM extension write-up"); the gaps
+found and documented below are exactly the kind of material that write-up
+will collect, not a substitute for it. See `docs/RWM_EXTENSIONS.md` for the
+full channel/field reference (`joint_position` channel, `extras.rwm`
+`semantics`/`articulations`, the v0 semantics taxonomy) and
+`docs/VERIFICATION.md`'s V9-prep section for the checkpoint-by-checkpoint
+writeup.
+
+### Joint schema: already vendored, newly exercised
+
+The pinned commit's joint-related JSON Schema files
+(`glTF.KHR_physics_rigid_bodies.joint{,.limit,.drive}.schema.json`,
+`node.KHR_physics_rigid_bodies.joint.schema.json`) were already vendored
+back in V1 as part of the original `physics_rigid_bodies/schema/*.json`
+wildcard fetch -- confirmed against the pinned commit's actual GitHub tree
+listing that nothing is missing, so no re-vendoring was needed (see
+`docs/schemas/khr/PROVENANCE.md`'s V9-prep update note). This milestone is
+simply the first to read/write them.
+
+### KHR joint encoding: hinge/slider as limit compositions
+
+Per the pinned spec README's "Joints" section (not just the JSON Schema
+files, which don't carry this prose): a joint's two **attachment frames**
+are each "the relative transform between the node and the first parent
+`motion` (or the simulation's fixed reference frame, if no such motion
+exists)". The worked example given there for a hinged door is followed
+literally, not approximated: "a 3D linear limit with zero maximum distance,
+a 1D angular limit with min/max describing the swing ... and a 2D angular
+limit with zero limits about the remaining two axes"
+(`gltfworld.ext.khr_physics.hinge_joint_limits`). A slider
+(`slider_joint_limits`) is the natural translation/rotation-swapped analog
+(3D angular limit locked at zero, 2D linear limit locked at zero, 1D linear
+limit as the travel range) -- not spelled out verbatim in the spec text, but
+a direct application of the same limit-composition primitives it describes.
+
+**Attachment frames, concretely**: rather than moving an articulated
+object's own mesh/collider origin to the physical hinge/slide point (which
+would desynchronize the visual mesh from the `KHR_implicit_shapes` collider
+-- both are always centered on the owning node's origin, with no offset
+field in this pinned commit, see "Honest gaps" below), each of `base`/`part`
+gets a second, motion-less, geometry-less **joint pivot** child node, nested
+one level under it (`node.children`), placed at `ArticulatedSpec.anchor` in
+that body's own local frame. The part-side pivot's nearest ancestor-with-
+`motion` is `part` itself, so its attachment frame is a fixed local offset
+that co-moves with the body exactly as the joint's own semantics require;
+the base-side pivot's nearest ancestor has no `motion` (base is static), so
+its attachment frame is its fixed offset from the world origin. The
+part-side pivot carries the node `joint` property (`connectedNode` = the
+base-side pivot, `joint` = index into the root `physicsJoints[]` array).
+Since gltfworld's object nodes were previously *always* scene roots (no
+node ever had `children`), `gltfworld.scene.convert._compute_scene_roots`
+now computes `scenes[0].nodes` as "every node not listed as somebody's
+child" instead of "every node" -- identical output when nothing has
+children (every pre-V9 episode), so this is a zero-risk generalization, not
+a behavior change for existing transport.
+
+**Simplifying convention** (`ArticulatedSpec`, `wm-articulated-v1`): `base`
+and `part` are authored at identity world orientation, and `axis` (0/1/2)
+indexes a *world*-aligned X/Y/Z axis at rest, matching the pivot nodes'
+identity local rotation -- not a limitation of `KHR_physics_rigid_bodies`
+itself (which supports arbitrary joint-local bases), just a simplification
+this milestone's own generated scenes use.
+
+### MJCF <-> KHR joint mapping (`gltfworld.datagen.articulated`)
+
+MuJoCo's own hinge/slide joints map directly onto the KHR limit
+compositions above, with one simplification that turned out to need no new
+MJCF machinery at all: since `base` never moves (`is_static=True`, no MJCF
+joint), "`part`'s motion relative to `base`" and "`part`'s motion relative
+to world" are kinematically identical. So `part` is placed directly under
+MuJoCo's `worldbody` (flat, exactly like every other gltfworld body --
+`gltfworld.datagen.mujoco_env` never needed body nesting either), with its
+`<joint type="hinge"|"slide" pos="..." axis="..." range="min max"
+damping="...">` given in `part`'s own body-local frame (MJCF's standard
+convention for a joint declared inside a `<body>`) -- computed by the same
+"rotate the world offset by the body's own orientation's conjugate" trick
+`gltfworld.scene.convert` uses for the KHR pivot nodes, just in MuJoCo's
+axis convention (`gltfworld.datagen.mj_convert`).
+
+`joint_pos` (the recorded `StateSeries` channel) is `data.qpos` at the
+joint's single DOF, read directly off MuJoCo every recorded frame --
+already in the units `KHR_physics_rigid_bodies.joint.limit` itself uses
+(radians for revolute, meters for prismatic), no conversion needed.
+
+**Found the hard way, fixed, and worth recording**: MJCF's *default*
+`compiler angle` unit is **degrees**, not radians -- silently
+reinterpreting `range="{min} {max}"` (authored in radians, matching the
+KHR/robotics convention this whole milestone uses) as degrees, compiling a
+door meant to swing up to ~1.9 radians into a joint actually limited to
+~1.9 *degrees* (0.033 rad). The joint hit that minuscule limit almost
+immediately and sat there under continued push pressure -- which looked
+enough like "reaches a limit and settles" to not be obviously wrong at a
+glance, until the recorded `joint_pos` trajectory was inspected directly.
+Fixed with an explicit `<compiler angle="radian"/>` in
+`_articulated_mjcf`'s generated XML.
+`gltfworld.datagen.mujoco_env`'s existing MJCF never hit this because it
+only ever uses `<freejoint>`, which has no angle-valued attributes at all.
+
+**Push force and joint damping are derived from the sampled mass/geometry,
+not fixed constants** -- found necessary, not just nicer, during
+development: a single fixed push-force number reliably overshoots a small/
+light door and undershoots a large/heavy one (or vice versa), and a single
+fixed damping *coefficient* is only "light" relative to one particular
+moment of inertia -- applied to a much larger or smaller door under the
+same-formula push, the residual post-limit-bounce settling either never
+finishes damping out within a short recorded episode (a very light door)
+or the push never has enough energy to reach the limit at all (a very
+heavy one, over-damped by the same fixed number). Both derived from a rough
+kinematic estimate (revolute: treat the part as a rod pivoting about one
+end, `I ~= (1/3) * mass * (2 * part_extent)^2`; prismatic: `F = mass *
+accel`), targeting a fixed decay *time constant* (`damping = I / tau` or
+`mass / tau`, `tau = 0.3s`) rather than a fixed damping number, so both push
+and damping scale consistently across the sampler's randomized mass/size
+range. Verified empirically across the sampler's full parameter range
+(mass 1.5-8kg, size 0.15-0.45m, limits 0.15-1.9 rad/m): robustly monotonic-
+to-peak and settled (see `tests/test_articulated_physics.py`).
+
+**Gravity coupling depends on which world axis the joint uses, and this is
+real physics, not a bug** -- found while debugging why some randomly-sampled
+axis choices "opened and stayed open" cleanly while others "opened, then
+drifted back closed over several seconds": a rotation axis exactly parallel
+to gravity (gltf axis=1, vertical Y) has *zero* gravity torque at every
+angle (the rotating body's height along that axis never changes, so gravity
+does no work on it) -- the door only has the scripted push's momentum and
+joint damping to work with, and with intentionally "light" damping, a hard
+bounce off the limit can take several seconds to fully settle. A horizontal
+hinge axis (0 or 2) instead makes the door pendulum-like: depending on which
+side of vertical it starts on, gravity can *assist* staying open (settles
+almost exactly at the limit, no long tail) or *oppose* it (swings back
+toward closed instead) -- both physically correct, not contradictory. Per
+`gltfworld.datagen.articulated`'s own "axis coverage over realism" design
+note, the general sampler still draws `axis` uniformly from `{0, 1, 2}` for
+full KHR `angularAxes`/`linearAxes` coverage; the physics-sanity tests
+specifically pin a vertical hinge axis (door) / horizontal slide axis
+(drawer) -- the gravity-decoupled cases -- for a reliably reproducible
+trajectory shape, rather than asserting "opens monotonically" against a
+combination where gravity may genuinely be fighting the push.
+
+### The articulation consistency check
+
+The moving part's recorded pose must equal the anchor point composed with
+the joint transform implied by the recorded `joint_pos` at every step:
+`part_pose(t) = anchor ∘ Rotate(axis, joint_pos(t))` (revolute) or `anchor +
+axis_vec * joint_pos(t)` (prismatic), reconstructed purely from
+`ArticulatedSpec`'s own metadata plus the recorded `poses`/`joint_pos` --
+not from any privileged access to MuJoCo's internal state
+(`tests/test_articulated_physics.py::test_articulation_consistency_*`,
+checked both on a freshly-simulated in-memory `Episode` and after a real
+save/load `.glb` round trip, mirroring `tests/test_provenance.py`'s
+pattern). Measured worst-case error across 60 sampled (seed, kind, axis)
+combinations: **0.0077m position, 0.014 quaternion-component rotation**
+(cross-validated against an independent `scipy.spatial.transform.Rotation`
+implementation of the same formula, not just gltfworld's own hand-rolled
+version) -- small, bounded, and concentrated mid-transient (near-exact at
+rest and once settled, per direct inspection of the error's time profile),
+consistent with a benign MuJoCo forward-kinematics/reporting artifact
+rather than a wrong formula (a genuinely wrong composition -- e.g. the
+degree/radian mixup above, or a sign-flipped axis -- produces errors many
+orders of magnitude larger, not a small bounded residual that vanishes at
+rest). The test's tolerance (0.03 / 0.03) is set with margin above this
+measured bound, not tuned to just barely pass.
+
+### Honest gaps (feeding the full V9 gap report)
+
+- **`joint.limit`'s `stiffness`/`damping` are soft-stop parameters, not
+  viscous joint damping.** They describe the *restorative* force applied
+  once a limit is exceeded (an optional spring instead of a hard stop); by
+  default the limit is infinitely stiff. There is no property in this
+  pinned commit's joint schema for "this hinge has some viscous drag across
+  its whole free range, even within its limits" (MJCF/URDF's per-joint
+  `damping`) or for `armature` (MJCF's added rotational/reflected inertia
+  term, used to improve numerical stability of the actuator/joint's
+  effective inertia -- not physical damping at all, but likewise
+  unrepresentable here). gltfworld's own generated episodes *do* use MJCF
+  joint damping to get realistic settling behavior, but that parameter has
+  no home in the KHR encoding -- a downstream KHR-only consumer doing fresh
+  forward simulation from the `.glb` alone would see an undamped (or only
+  soft-limit-damped) joint, not the damped one MuJoCo actually simulated.
+- **`joint.drive` models a persistent spring-to-target, not a one-shot
+  push.** The drive force is `stiffness * (positionTarget - positionCurrent)
+  + damping * (velocityTarget - velocityCurrent)` -- an always-on motor
+  chasing a target, not a finite-duration external impulse. gltfworld's
+  scripted "push" actuation (a constant generalized force applied for a
+  bounded time window, then released) doesn't fit this shape without
+  misrepresenting it as a permanently-active motor holding some target
+  forever, so it is **not** encoded as a KHR `drive` at all -- the driving
+  force only ever existed inside the MuJoCo simulation that produced the
+  recorded `poses`/`joint_pos` trajectory; the KHR joint dict for these
+  episodes carries `limits` only, no `drives`.
+- **The handle's rigid attachment isn't encoded as a KHR joint/weld.** Its
+  motion is *derived* (`handle_pose(t) = part_pose(t) ∘
+  (handle_local_offset, identity)`), not independently simulated or
+  KHR-joint-constrained -- doing so properly would need a second,
+  anchor-aligned pivot-node pair (per the same construction used for the
+  main hinge/slide joint) purely to describe a rigid weld, which this
+  milestone judged not worth the added node/joint count for a purely
+  cosmetic part. `extras.rwm.semantics` still identifies it
+  (`{"labels": ["handle"], "affordances": ["pullable"]}`), and its animated
+  pose track is always exactly consistent with rigidly following `part` --
+  sufficient for this project's playback/training use case, but a real gap
+  for a downstream engine trying to do fresh forward simulation from the
+  `.glb` alone without gltfworld's own semantics convention.
+- **No offset/center field on `KHR_implicit_shapes` colliders.** This is
+  *why* the joint-pivot-child-node design (above) was necessary instead of
+  simply moving each articulated object's own node origin to the physical
+  hinge point -- box/sphere/cylinder shapes are only ever defined centered
+  on their owning node's origin in this pinned commit, with no separate
+  offset/center property. Moving an object's own origin to the hinge would
+  have desynchronized its `KHR_implicit_shapes` collider from its visual
+  mesh (both still centered on that now-relocated origin, no longer at the
+  shape's true geometric center) -- an interop defect in the same spirit as
+  the V3.1 cylinder-axis finding. The pivot-child-node design sidesteps it
+  entirely: object nodes keep their ordinary, unmodified mesh/collider
+  convention.
+
+`gltfworld inspect` (`gltfworld.cli`) additively reports the new
+`joint_pos` optional channel and an `articulations:` summary line per
+joint (type/base/part/axis/range/handle) when present -- `(none)`/absent for
+every pre-V9-prep episode, exactly as before.
+
+### `wm-articulated-v1` distribution (`gltfworld.datagen.articulated.sample_articulated_scene`)
+
+| field | distribution |
+| --- | --- |
+| kind | `"door"` / `"drawer"`, 50/50 (or pinned via `kind=`) |
+| joint axis | `Uniform{0, 1, 2}` (or pinned via `axis=`) -- see "axis coverage over realism" above |
+| base (cabinet) half-extents | `U[0.25, 0.4] x U[0.3, 0.45] x U[0.25, 0.4]` m |
+| part extent (sweep direction) | `U[0.15, 0.35]` m |
+| part span (along the joint axis) | `~U[0.7, 1.0] * base_half` (door: 0.9-1.0x; drawer: 0.7-0.95x) |
+| part thickness | `U[0.015, 0.03]` m |
+| part mass | door `U[2, 8]` kg; drawer `U[1.5, 5]` kg |
+| joint limit range | door `[0, U[1.0, 1.9]]` rad (~57-109 deg); drawer `[0, U[0.15, 0.35]]` m |
+| initial joint position | `U[min, ~0.3-0.35 * max]` (starts mostly-closed, not always exactly 0) |
+| push force/torque | derived from mass/geometry (see above), `x U[0.9, 1.15]` jitter |
+| joint damping | derived from mass/geometry, targeting `tau=0.3s` decay (see above) |
+| push window | `[0.05s, 0.30s]` (a brief kick, not held for the whole episode) |
+| handle size | `U[0.015, 0.03]` m (cube) |
+| ground | 1 static box (3m x 0.2m x 3m), category `"ground"` |
+| camera | 1 fixed camera, `aspect=1.0` |
+
+### Acceptance (see `docs/VERIFICATION.md`'s V9-prep section for exact commands)
+
+- KHR joint dicts + node `joint` property validate against the vendored
+  schemas; `RWM_state_series`'s `joint_position` channel validates against
+  the (updated) vendored schema.
+- Articulated `Episode` <-> GLB round-trips exactly (in-memory and through a
+  real `.glb` file), including `ArticulatedSpec`/`joint_pos`.
+- A sample articulated GLB passes the real, pinned Khronos glTF-Validator
+  with 0 errors.
+- Door pushed with positive torque (vertical hinge, gravity-decoupled):
+  opens monotonically to its peak, settles within its limits.
+- Drawer pushed with positive force (horizontal slide axis): stays within
+  its travel limits throughout.
+- The articulation consistency check holds (see above) to <= 0.03m / 0.03
+  quaternion-component tolerance, both in-memory and post-round-trip.
