@@ -111,3 +111,45 @@ Closed-loop demo: perceive from frame 0 and 1 (rendering ground-truth RGB, runni
 ### Artifacts
 
 Artifacts (metrics.json, attribution.png, per-arm GLBs, videos) live in `runs/closed-loop-v1/` (git-ignored). Attribution curve shows median position error by horizon for all four arms + ballistic reference; `n=20` episodes on test split.
+
+## V8 -- Physion external anchor (2026-07-30)
+
+**Protocol**: option (b) from `docs/PHYSION.md` -- the state-based track. All 150 Collide test trials (the smallest rigid Physion scenario, `Collide_testing_HDF5s.tar.gz`) were converted HDF5 -> real glTF via `gltfworld.physion.convert` (real per-object mesh geometry, real per-frame poses/velocities, `KHR_physics_rigid_bodies`/`KHR_implicit_shapes` sphere/box approximation, `RWM_state_series`, `extras.rwm` role labels), then evaluated for Object Contact Prediction ("does the red/agent object ever touch the yellow/patient zone") three ways via `gltfworld.physion.ocp_eval`:
+
+- **GT-contact oracle**: real per-frame mesh geometry (both objects), nearest-vertex proximity threshold, calibrated on a deterministic 50-trial held-out calibration split, evaluated on the remaining 100 (also reported on the full 150 for reference).
+- **Our dynamics rollout**: the first 15 real GT frames mapped into gltfworld's own D=22 tensor contract (`gltfworld.scene.contract.episode_to_tensors`, no new conversion logic -- literally the same function `dynamics-v1`'s own eval uses), rolled forward with `InteractionTransformer` (`runs/dynamics-v1/best.safetensors`, V5's zero-shot-transferred checkpoint, no Physion-specific fine-tuning) to the trial's last recorded frame, contact predicted via the *same* calibrated threshold against a coarse bounding-sphere approximation (mean AABB half-extent).
+- **Ballistic control**: identical protocol, `BallisticBaseline` in place of the learned model.
+
+Calibrated threshold: **0.1 m** (grid search over 17 values, maximizing calibration-set oracle accuracy). Sanity check: the HDF5's own per-frame `target_contacting_zone` label (`any()` across the trial) agrees with the independently-packaged PhysionTest-Core archive's `labels.csv` on **150/150** trials (100.0%) -- the two ground-truth sources are consistent, so the whole exercise isn't bounded by a labeling discrepancy before any modeling starts.
+
+### Accuracy (95% Wilson CI)
+
+| track | calibration (n=50) | held-out (n=100) | full Collide test set (n=150) |
+| --- | --- | --- | --- |
+| GT-contact oracle | 0.940 [0.838, 0.979] | **0.920** [0.850, 0.959] | 0.927 [0.873, 0.959] |
+| our dynamics (InteractionTransformer, zero-shot) | -- (not calibrated on) | **0.490** [0.394, 0.587] | 0.527 [0.447, 0.605] |
+| ballistic control | -- (not calibrated on) | **0.490** [0.394, 0.587] | 0.527 [0.447, 0.605] |
+| chance (label balance) | -- | 0.500 (75 True / 75 False, exactly balanced) | 0.500 |
+
+### Divergence diagnostic (median final-recorded-frame agent-patient distance, full 150)
+
+| track | median | p25 | p75 |
+| --- | --- | --- | --- |
+| our dynamics | **2.32 m** | 1.77 m | 4.16 m |
+| ballistic | 102.54 m | 102.49 m | 102.54 m |
+
+### Key findings
+
+**(1) The GT-contact oracle establishes a strong, non-trivial ceiling: 92.0% held-out.** Full real trajectories + real mesh geometry + a single calibrated proximity threshold reproduces the simulator's own contact label 92% of the time -- confirming the OCP task is well-posed from state alone (not an artifact of a lucky calibration: the calibration-set number, 94.0%, and the full-150 number, 92.7%, both land in the same band). The ~7-8% of trials this ceiling misses are presumably where nearest-*vertex* distance (not true surface-to-surface distance, see `docs/PHYSION.md`'s findings) diverges from the simulator's own internal collision detection, or ambiguous grazing contacts.
+
+**(2) Our dynamics model's zero-shot transfer to Physion collapses to chance -- exactly the outcome DESIGN.md/PHYSION.md's honest feasibility notes anticipated.** 49.0% held-out, indistinguishable from the 50% chance rate given the label's exact 50/50 balance (CI [0.394, 0.587] comfortably straddles 0.5). This is a real, reportable finding, not a bug: `InteractionTransformer` was trained exclusively on `wm-scenes-v1`'s tightly-bounded distribution (1-5 objects, size 0.05-0.25m, |v|<=1.5 m/s, density 300-3000 kg/m^3, DESIGN.md) and Physion's Collide trials sit far outside it (masses up to 500 in the units this milestone's D=22 contract expects, launch speeds ~7.6 m/s, no shared "ground" concept for the model's learned ground-token to attend to at all -- the true floor isn't even a tracked rigid body in Physion's HDF5, see `docs/PHYSION.md` finding 7). A failed transfer with a working, independently-verified transport conversion (stage 2's round-trip tests) is still a successful gap experiment, per this milestone's own framing.
+
+**(3) The ballistic control is numerically identical to our dynamics model in binary accuracy, but the *continuous* divergence tells a different, more informative story.** Both tracks predict "contact" in only 3-4/150 trials (i.e. both are practically a trivial "always predict no-contact" classifier at the calibrated 0.1m threshold, which is why both land within noise of the 50% chance rate). But the underlying rollout trajectories are not remotely similar: our dynamics model's median final-frame agent-patient distance is **2.32m**, ballistic's is **102.54m** -- a ~44x difference, reminiscent of V5's own `wm-scenes-v1` result (ballistic diverges catastrophically past first contact; the learned model stays bounded). Ballistic's distribution is also strikingly *tight* (p25-p75 spans barely 0.05m around 102.5m) -- consistent with unconstrained free-fall diverging to roughly the same large distance regardless of trial specifics, since nothing stops it. The learned model, even completely out of its training distribution, still imposes *some* learned physical structure that keeps rollouts an order of magnitude closer to plausible -- **but not close enough to matter at the ~0.1m scale this particular task's threshold operates at.** This is the clearest evidence in this milestone that raw position-error improvement (the V5 acceptance bar) doesn't automatically transfer into task accuracy on a fine-grained, threshold-sensitive downstream metric under severe domain shift.
+
+**(4) Honest comparison against the published table.** Humans ~71%, particle-based GNS ~71%, DPI ~70%, pixel-based models 55-65% (all cross-scenario averages, vision-based readouts, per `docs/PHYSION.md`). This milestone's numbers are **not directly comparable**: they cover one scenario (Collide, not the 8-scenario average the published table reports), and this track is **state-based** (real mesh geometry + real pose/velocity), not vision-based -- a fundamentally easier input modality than any of the published numbers assume. The GT-contact oracle's 92% (state-based, one scenario) sits *above* every published number precisely because it's not doing the same job -- it's an upper-bound sanity check on the label, not a competing model. The one number that *is* in the same spirit as the published pixel-model row is our-dynamics' 49% -- and it lands well *below* even the weakest published pixel baseline (55%), because it is tested zero-shot on a model that never saw Physion's object/scale/mass distribution during training, whereas every published number in the table (including the pixel-based ones) was trained or fine-tuned on Physion data. This is the honest, load-bearing caveat: the comparison is contextual, not head-to-head.
+
+**(5) Conversion findings pointer.** Fourteen concrete impedance-mismatch findings (missing normals, mesh pivot-vs-center with no KHR offset field, two-friction-coefficients collapse, no cylinder/convex collider, left- vs right-handed chirality, synthesized camera orientation, no ground-plane object, dropped collision-event records, truncated per-object physics metadata for decorative objects, empty meshes for some real-world asset kinds, and a tensor-contract category-vocabulary mismatch) are recorded in `docs/PHYSION.md`'s "Physion conversion findings" section -- the primary gap-report evidence this milestone produces for V9.
+
+### Artifacts
+
+`runs/physion-ocp-v1/metrics.json` (git-ignored) has the full breakdown (per-track accuracy at all three splits, divergence diagnostics, calibration trial ids, the Core-labels.csv sanity check). Converted GLBs live in `data/external/physion/glb/Collide/` (git-ignored, 150 files, regenerated by `gltfworld.physion.ocp_eval.convert_all_trials`, idempotent/resumable). See `docs/VERIFICATION.md`'s V8 section for the exact re-run command.

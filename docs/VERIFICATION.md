@@ -1285,3 +1285,103 @@ full training/eval runs).
 ### Observed (final, V7)
 
 Closed-loop demo on 20 test-split episodes with `perception-v4-cnn-40k` CNN encoder + `dynamics-v1` transformer: Arm A (oracle) baseline, Arm B (oracle + chi(3)-calibrated noise) upper bound on i.i.d.-measurement-noise cost, Arm C (real closed loop) shows **1.62 m position error at h=99** vs. ballistic's **55.5 m** (34× improvement). Key findings: (1) detector errors are frame-correlated (lag-1 autocorrelation 0.55–0.82), causing naive i.i.d.-noise model (Arm B) to diverge 17× faster than real detector (Arm C) at h=99; (2) learned dynamics keeps imperfect perceptual observations physically plausible. Attribution curve, per-arm trajectory metrics, and real glTF at every hop archived in `runs/closed-loop-v1/`.
+
+## V8 -- Physion external anchor (state-based track)
+
+Needs the `sim` extra (`h5py`, added this milestone) + `ml` extra. The
+end-to-end checkpoints below additionally need real, gitignored assets:
+`data/external/physion/hdf5/extracted/Collide/hdf5s/*.hdf5` (150 files,
+32.62 GiB downloaded + extracted from `Collide_testing_HDF5s.tar.gz`, see
+`docs/PHYSION.md`) and `runs/dynamics-v1/best.safetensors` (V5's trained
+checkpoint). See DESIGN.md's V8 line and `docs/PHYSION.md` (schema,
+conversion findings, "V8 decision" section) for the full design writeup
+this section verifies against.
+
+### Checkpoint: HDF5 acquisition + schema
+
+- **Purpose**: confirm the downloaded archive is genuine (not truncated/
+  corrupted) and that the schema documented in `docs/PHYSION.md` was
+  derived from the real file, not assumed from the upstream repo's docs.
+- **Command**: `curl -sI https://physics-benchmarking-neurips2021-dataset.s3.amazonaws.com/Collide_testing_HDF5s.tar.gz` (compare `Content-Length` against `docs/PHYSION.md`'s table); `uv run pytest tests/test_physion_convert.py tests/test_physion_ocp_eval.py -v` (skips cleanly if the archive isn't present on this machine).
+- **Expected result / observed**: `Content-Length: 35026607691` (exact
+  match, 32.62 GiB); all real-data tests pass when the archive is present
+  (**19/19** across both test files on this machine), skip cleanly
+  otherwise.
+
+### Checkpoint: HDF5 -> glTF conversion (stage 2)
+
+- **Purpose**: confirm `gltfworld.physion.convert` produces valid, faithful
+  glTF from real per-trial HDF5 data -- real mesh geometry, real per-frame
+  poses/velocities, physics/semantics metadata -- per DESIGN.md's "object
+  states -> our glTF conversion experiment" line.
+- **Command**: `uv run pytest tests/test_physion_convert.py -v`
+- **Expected result / observed**: **8/8 pass** on 3 real converted Collide
+  trials: glTF-Validator **0 errors** (warnings, if any, are only
+  `UNSUPPORTED_EXTENSION` for the draft/custom extensions, same bar as V1's
+  own validator test); real mesh POSITION/NORMAL/indices accessors
+  round-trip bit-exact; pose-animation frame count equals the source
+  HDF5's frame count exactly (152 == 152 on the sampled trials); poses/
+  velocities/physics metadata (mass/friction/restitution/is_static/
+  category/role) round-trip through the *existing*, unmodified
+  `gltfworld.scene.convert.episode_from_gltf` to `<=1e-5` absolute.
+- **Full-archive robustness**: all 150 Collide test trials convert without
+  error (`gltfworld.physion.ocp_eval.convert_all_trials`), including two
+  edge cases only found at full scale (not in the initial 3-trial sample):
+  distractor/occluder objects with truncated physics-metadata arrays, and
+  13 real-world asset model names with empty exported mesh geometry --
+  both handled with documented, tested fallbacks (see
+  `docs/PHYSION.md` findings 12-13), never affecting the OCP-relevant
+  (agent/patient) geometry in any of the 150 trials checked.
+
+### Checkpoint: OCP evaluation (stage 3)
+
+- **Purpose**: confirm the OCP accuracy numbers in `docs/RESULTS.md`'s V8
+  section are reproducible, and that the evaluation harness's own building
+  blocks (Wilson CI, deterministic calibration split, threshold
+  calibration, the GT-contact oracle's real-mesh proximity computation) are
+  independently correct.
+- **Command**: `uv run pytest tests/test_physion_ocp_eval.py -v`; full run:
+  ```
+  uv run python -m gltfworld.physion.ocp_eval \
+      --hdf5-dir data/external/physion/hdf5/extracted/Collide/hdf5s \
+      --glb-dir data/external/physion/glb/Collide \
+      --dynamics-ckpt runs/dynamics-v1/best.safetensors \
+      --out runs/physion-ocp-v1
+  ```
+- **Expected result / observed**: **11/11** unit + real-data smoke tests
+  pass. Full run (150 trials, ~44s wall on this machine, CPU-only): GT-
+  contact oracle **92.0%** held-out accuracy (n=100, 95% CI [0.850, 0.959]);
+  our dynamics (zero-shot `InteractionTransformer`) **49.0%** held-out
+  (n=100, CI [0.394, 0.587], statistically indistinguishable from the 50%
+  chance rate); ballistic control identical in binary accuracy but median
+  final-frame divergence **2.32m vs. 102.54m** (our dynamics vs. ballistic)
+  -- full breakdown and discussion in `docs/RESULTS.md`'s V8 section.
+  Sanity check: the HDF5's own per-frame contact label agrees with the
+  independently-shipped Core archive's `labels.csv` on **150/150** trials
+  (100%).
+
+### Checkpoint: full test suite (fast lane)
+
+- **Purpose**: confirm this milestone didn't regress anything upstream.
+- **Command**: `uv run pytest -v -m "not gpu"`
+- **Expected result / observed**: **275 passed, 15 deselected** (not-gpu;
+  up from V7's 248/15 -- `tests/test_physion_convert.py` (8 tests) and
+  `tests/test_physion_ocp_eval.py` (11 tests) are new; `tests/
+  test_physion_ingest.py` (8 tests, from the pre-V8 `v8-physion-ingest`
+  merge) already counted toward V7's baseline via the merge).
+
+### Acceptance
+
+Per this milestone's own rules ("a failed transfer with a working
+transport-conversion is still a successful gap experiment -- frame it that
+way"): the transport-conversion half (stage 2) is unambiguously successful
+(validator-clean, bit-exact round trips, verified at both 3-trial and
+full-150-trial scale). The dynamics-model half (stage 3) shows a genuine,
+honestly-reported zero-shot transfer collapse to chance -- exactly the
+outcome DESIGN.md/`docs/PHYSION.md`'s own honest feasibility notes
+anticipated ahead of time, not a surprise discovered after the fact. Both
+outcomes are reported plainly in `docs/RESULTS.md`'s V8 section, including
+the explicit, load-bearing caveat that this milestone's numbers are not a
+head-to-head comparison against the published benchmark table (one
+scenario, state-based input, a zero-shot-transferred model vs. every
+published number's trained/fine-tuned one).

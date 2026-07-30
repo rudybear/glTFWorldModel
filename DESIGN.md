@@ -1,6 +1,6 @@
 # DESIGN
 
-Status: 2026-07-30, milestone V7.
+Status: 2026-07-30, milestone V8.
 
 ## Architecture flow
 
@@ -493,9 +493,15 @@ model milestone lined up, so dynamics moved first.
   / visual) attribution analysis separating perception-induced from
   dynamics-induced rollout error. See "Closed-loop demo + attribution (V7)"
   below and `docs/VERIFICATION.md`'s V7 section.
-- **V8** — external eval anchor: Physion replication (the primary
-  *external* correctness anchor for this project's eval numbers, per V4's
-  own metric-cross-validation note).
+- **V8** (done) — external eval anchor: Physion replication, state-based
+  track (the primary *external* correctness anchor for this project's eval
+  numbers, per V4's own metric-cross-validation note). HDF5 -> real glTF
+  conversion (`gltfworld.physion.convert`) verified clean at both 3-trial
+  and full-150-trial scale; OCP evaluation (`gltfworld.physion.ocp_eval`)
+  shows a strong 92%-held-out GT-contact oracle ceiling but a zero-shot
+  `InteractionTransformer` transfer collapse to chance -- both outcomes
+  reported honestly. See `docs/PHYSION.md` (schema, decision, conversion
+  findings) and `docs/RESULTS.md`/`docs/VERIFICATION.md`'s V8 sections.
 - **V9** — gap report + RWM extension write-up; PoC evaluation wrap-up.
 
 ## Dataset build (V4)
