@@ -1,6 +1,6 @@
 # DESIGN
 
-Status: 2026-07-28, milestone V6.
+Status: 2026-07-30, milestone V7.
 
 ## Architecture flow
 
@@ -488,7 +488,11 @@ model milestone lined up, so dynamics moved first.
   scene state (`PerceptionDETR`) + Hungarian matching/set loss +
   training/eval harness. See "Perception model (V6)" below and
   `docs/VERIFICATION.md`'s V6 section.
-- **V7** — inference loop: model output -> glTF -> renderer, closed loop.
+- **V7** (done) — closed-loop demo + attribution: perceive -> roll forward
+  -> re-render, real glTF at every hop, plus a 3-arm (oracle / oracle+noise
+  / visual) attribution analysis separating perception-induced from
+  dynamics-induced rollout error. See "Closed-loop demo + attribution (V7)"
+  below and `docs/VERIFICATION.md`'s V7 section.
 - **V8** — external eval anchor: Physion replication (the primary
   *external* correctness anchor for this project's eval numbers, per V4's
   own metric-cross-validation note).
@@ -1251,3 +1255,247 @@ encoder does). Per this milestone's own scope boundary, the full 25k-step
 run against `perception_v2_cnn.json` -- the only way to confirm whether this
 early trend holds all the way to the milestone's 0.05m acceptance bar -- is
 the orchestrator's to launch separately, not run here.
+
+## Closed-loop demo + attribution (V7)
+
+`gltfworld.eval.closed_loop` is the flagship artifact this project's whole
+architecture-flow diagram (top of this document) has been building toward:
+perceive -> roll forward -> re-render, with real glTF at every hop, plus an
+attribution analysis that separates *how much of the rollout error is the
+dynamics model's own ceiling* from *how much is perception's fault* --
+required precisely because V6 established perception is real but imperfect
+(existence F1 ~0.89, median matched position error ~0.21m, class accuracy
+~0.95 on `perception-v1`/test with the CNN encoder) rather than assuming a
+perfect oracle detector.
+
+    uv run python -m gltfworld.eval.closed_loop \
+        --episodes data/perception-v1 \
+        --dyn-ckpt runs/dynamics-v1/best.safetensors \
+        --per-ckpt runs/perception-v3-cnn/best.safetensors \
+        --per-metrics runs/perception-v3-cnn/eval/metrics.json \
+        --out runs/closed-loop-v1 --n-episodes 20 --video 5
+
+### Three arms, per selected test episode
+
+- **Arm A (oracle)**: the exact ground-truth state at `t=0` (already
+  carries the simulator's true velocity/angular-velocity -- not a finite
+  difference) rolled forward by `InteractionTransformer`
+  (`gltfworld.eval.rollout.rollout`, reused verbatim). This is the dynamics
+  model's own error ceiling; no perception involved.
+- **Arm B (oracle + measured noise)**: the same ground-truth *poses* at
+  `t=0,1`, independently perturbed *per frame* by Gaussian noise, then
+  finite-differenced into velocity/angular-velocity the same two-frame way
+  Arm C's real detections have to be -- object identity/count and every
+  physics-material field (mass/friction/restitution/shape/size) stay exact
+  GT. This isolates *pose-measurement noise alone*, with no
+  detection/correspondence error mixed in.
+- **Arm C (visual, the real closed loop)**: render GT frames 0 and 1 (the
+  vendored `EpisodeRenderer`), run the real `PerceptionDETR` on each frame
+  independently, existence-threshold (0.5, same as
+  `gltfworld.eval.perception_eval`), Hungarian-match frame 0's detections to
+  frame 1's by position + class + size proximity to get a cross-frame
+  correspondence, finite-difference velocity/angular-velocity from the
+  matched pairs, and roll forward *only* the correspondences that survived.
+
+Every arm's rollout is reconstructed into a full `Episode`
+(`gltfworld.eval.rollout.tensors_to_episode`), saved via `save_episode`, and
+reloaded via `load_episode` *before* metric computation -- transport is
+exercised at every hop, and every round trip is asserted `<= 1e-6`
+(`gltfworld.eval.closed_loop._roundtrip_episode`), exactly the same
+discipline every earlier milestone's own eval CLI follows. A `BallisticBaseline`
+reference (rolled out from Arm A's own exact initial state) is added as a
+4th curve for scale, reusing V5's baseline directly.
+
+### Noise calibration (Arm B): exact chi(3) inversion, not an RMS approximation
+
+Perception's own reported error statistics are *median magnitudes* of a
+3D vector (`matched_position_error_m`, `matched_rotation_error_deg_by_shape`
+-- both already-non-negative norms), not a per-axis sigma directly. Given an
+assumed isotropic Gaussian noise model (`x ~ N(0, sigma^2 * I_3)`), `||x||`
+follows a 3-DOF chi distribution whose median is `sigma * chi(df=3).ppf(0.5)`
+(`~1.5382`) -- so `gltfworld.eval.closed_loop.noise_params_from_metrics`
+inverts this *exactly* (via `scipy.stats.chi`, already an `ml`-extra
+dependency) rather than an approximate `median/sqrt(3)` RMS rule of thumb:
+`sigma_pos = median_position_error_m / chi(df=3).ppf(0.5)`, and per-shape
+`sigma_rot = radians(median_rotation_error_deg[shape]) / chi(df=3).ppf(0.5)`
+(sphere fixed at 0 -- `matched_rotation_error_deg_by_shape` never reports one
+for sphere either, per V6's own "a sphere has no meaningful orientation"
+convention). `--noise-sigma-pos`/`--noise-sigma-rot-deg` let a caller
+override or fully replace the `metrics.json`-derived values without one.
+
+Noise is injected independently per frame (frame 0 and frame 1 each get
+their own fresh draw, not one shared offset that would cancel in the finite
+difference) -- rotation composed on the left (`dq * quat`), the same
+convention `gltfworld.train.train_dynamics.add_input_noise` already
+established for its own training-time input-noise injection.
+
+### Cross-frame correspondence and Arm C assembly: reusing `hungarian_match` twice, for two different jobs
+
+`gltfworld.models.matching.hungarian_match`'s signature is generic (any
+"pred" set of positions/class-logits/sizes against any "gt" set with a mask)
+-- Arm C reuses it verbatim for two structurally distinct jobs rather than
+writing a new matcher:
+
+1. **Frame0 <-> frame1 correspondence**
+   (`gltfworld.eval.closed_loop.match_detections_across_frames`): frame 1's
+   existence-thresholded detections stand in as `hungarian_match`'s "GT"
+   side (each one is a real, existent row per its own mask), frame 0's as
+   the "pred"/query side. Unmatched detections on either side (Hungarian
+   assignment on a rectangular cost matrix) are dropped from Arm C's
+   rollout -- a genuinely spurious/exiting/entering object, not silently
+   forced into a correspondence it doesn't have.
+2. **Arm C <-> real GT correspondence, for scoring only**
+   (`match_armc_to_gt`): after Arm C's `(N_C, 22)` initial state is
+   assembled from step 1's surviving correspondences, it is separately
+   Hungarian-matched against the *real* GT frame-0 state -- purely to know
+   which of Arm C's rolled-out objects (if any) a given horizon's
+   trajectory error should be measured against. This second match is never
+   fed back into what Arm C's rollout actually saw (the closed loop never
+   peeks at GT to fix its own state); it only exists after the fact, for
+   metrics, exactly the same "matched-pair scoring, decoupled from the
+   detector's own blind assembly" discipline `perception_eval.run_inference`
+   already established.
+
+**Documented structural blind spot: mass/friction/restitution.**
+`PerceptionDETR` never predicts these (V6's own architecture has no head for
+them) -- so every Arm C object is assigned the same fixed default physics
+values `gltfworld.eval.perception_eval` already uses for its own
+false-positive rendering fallback (`mass=1.0`, `friction=0.6`,
+`restitution=0.1`). This is a real, honest gap, not a bug: it means the
+measured B->C gap is *not* purely "detection/correspondence noise" -- part
+of it is this orthogonal, unavoidable-given-the-model's-output-space blind
+spot. `tests/test_closed_loop.py::
+test_build_arm_c_assembly_perfect_perception_matches_gt_with_default_physics`
+makes the boundary of this gap precise: with a perfect mock detector (exact
+GT position/quat/size/shape/class, existence=1) and zero Arm B noise, Arm
+C's assembled state matches Arm A/GT's exactly, *provided* the GT fixture's
+own physics fields are constructed to equal those same defaults -- i.e. the
+only way Arm C can differ from a "perfect" oracle is via this documented
+physics-params gap plus whatever the real detector actually gets wrong.
+
+Color/category on Arm C's synthetic `ObjectSpec`s (needed only to build a
+renderable glTF, never fed into the tensor-contract state or any metric) is
+an honest GT-assist for matched objects (copied from the corresponding real
+GT object) or a fixed neutral-gray fallback for a genuine false positive --
+the exact same convention `perception_eval.build_predicted_episode` already
+established for its own re-render check.
+
+### Metrics: detection-level vs. matched-trajectory error, kept separate
+
+Per the milestone's own "be precise about what's averaged" requirement:
+
+- **Detection-level** (`arm_c_detection` in `metrics.json`): precision/
+  recall/F1 over the *corresponded* (survived frame0<->frame1 matching)
+  objects against real GT, aggregated across every episode (`tp`/`fp`/`fn`
+  accumulated the same way `gltfworld.eval.perception_eval`'s own existence
+  metric does) -- a stricter, two-frame-survival version of single-frame
+  detection accuracy, plus `n_zero_correspondence_episodes` (episodes where
+  Arm C had nothing to roll forward at all).
+- **Matched-trajectory error** (`arms.C_visual` in `metrics.json`): median +
+  IQR position/rotation error at each horizon, computed *only* over Arm C
+  objects that got a genuine GT correspondence in step 2 above -- unmatched
+  Arm C objects and undetected GT objects never enter this average (they'd
+  be scoring "how wrong is a comparison that shouldn't exist" otherwise).
+  `gltfworld.eval.closed_loop.ArmAccumulator` collects the *full* per-horizon
+  curve (every horizon `1..T-1`, not just the reported discrete set) across
+  every episode -- the same "median + IQR over every unmasked
+  (episode, object) pair" population convention `gltfworld.eval.rollout
+  .horizon_metrics` already established, just accumulated per-episode (Arm
+  C's object count varies per episode, so it can't be stacked into one
+  batched tensor the way Arm A/B's fixed, GT-identity-preserving object
+  count can).
+
+`attribution.png`: median position error vs. horizon (log-y), one curve per
+arm + the ballistic reference. The A->B gap is (an upper bound on) the
+perception-noise cost; the B->C gap is the detection/correspondence cost
+*plus* the documented physics-params blind spot above; Arm A alone is the
+dynamics model's own ceiling.
+
+### A real finding from the 3-episode GPU smoke: Arm B can diverge *faster* than Arm C
+
+Measured on this machine (`runs/dynamics-v1` + `runs/perception-v3-cnn`,
+3 real `perception-v1` test episodes, `tests/test_closed_loop_gpu.py`):
+median position error at `h=1/5/10/30` --
+
+| arm | h=1 | h=5 | h=10 | h=30 |
+| --- | --- | --- | --- | --- |
+| A (oracle) | 0.0049 | 0.0199 | 0.0254 | 0.1244 |
+| B (oracle+noise) | 0.2329 | 0.9162 | 1.5404 | 3.3760 |
+| C (visual) | 0.5170 | 0.6262 | 0.7083 | 0.8259 |
+| ballistic | 0.0053 | 0.0267 | 0.0534 | 4.6160 |
+
+A <= C holds cleanly (the sanity bar `tests/test_closed_loop_gpu.py` actually
+asserts) but the full `A <= B <= C` ordering does **not** hold at
+`h=5/10/30`: Arm B diverges *faster* than Arm C, not slower. Reported here
+honestly rather than tuned away, per this project's own "if violated, that's
+a REPORTED finding not a silent pass" policy (identical in spirit to V5's
+MLP-competitiveness finding and V6.1/V6.2's postmortems) --
+`gltfworld.eval.closed_loop.aggregate_results`'s `ordering_check` records
+this per-horizon for exactly this reason, un-gated.
+
+**Why, most likely** (a real, explicable mechanism, not a bug -- the
+zero-noise/perfect-perception exactness tests above independently confirm
+the assembly arithmetic itself is correct): Arm B's noise model treats each
+frame's position measurement as an *independent* fresh Gaussian draw, and
+`finite_diff_velocity` divides by a small `dt` (~0.034s here) -- so
+`sigma_vel ~ sqrt(2) * sigma_pos / dt`. At this run's calibrated
+`sigma_pos ~= 0.136m` (from `perception-v3-cnn`'s measured 0.2095m median,
+V6.3's CNN encoder), that implies an injected velocity noise on the order of
+several m/s, dwarfing `wm-scenes-v1`'s own sampled speed range (`<=1.5 m/s`
+initial, DESIGN.md's V3 section) and driving Arm B's rollout to diverge very
+fast. The real detector's actual per-object errors, by contrast, are
+apparently *not* well-modeled as fresh-i.i.d.-per-frame: the same trained
+model looking at two adjacent, nearly-identical frames of the same object
+likely makes a *correlated* (systematically-biased-the-same-way) error
+rather than an independent one, which partially cancels in the finite
+difference instead of amplifying it -- explaining why the real Arm C
+finite-diffed velocity ends up materially better-behaved than Arm B's
+i.i.d.-noise model predicts. This is itself a useful, honest finding about
+the limits of an i.i.d.-Gaussian noise model as a stand-in for "what
+perception noise alone does" at short frame gaps, not a reason to loosen or
+re-tune `--noise-sigma-*` to make the ordering come out prettier. Only 3
+episodes were run here (this milestone's own GPU-smoke scope, see
+`docs/VERIFICATION.md`'s V7 section); the orchestrator's full 20-episode run
+is the statistically meaningful version of this same measurement and may or
+may not reproduce this exact pattern.
+
+### Video (`--video K`, gpu)
+
+Reuses `EpisodeRenderer` exactly like `gltfworld.eval.rollout
+._render_side_by_side_videos` (one process-wide renderer, `imageio.mimwrite`,
+30fps): a 2-panel `GT | Arm C` mp4 and a 3-panel `GT | Arm A (oracle) | Arm C
+(visual)` mp4 per requested episode, under `out/video/`.
+
+### Tests
+
+- CPU (`tests/test_closed_loop.py`, 24 tests): noise-injection statistics
+  sanity (empirical sigma matches the requested one within 5% at n=20,000);
+  zero-noise/deterministic-seed exactness for Arm B; the arm-assembly
+  exactness bar described above for Arm C with a synthetic perfect
+  detector (incl. a zero-detections degenerate case); `hungarian_match`-based
+  cross-frame correspondence on a hand-built 2-object case; the exact
+  chi(3) noise-calibration inversion against a synthetic `metrics.json`;
+  dataset-resolution variants (raw glb dir, dataset root, packed dir/file);
+  deterministic split filtering (`split_id_for_seed`); the full
+  `process_episode` glTF-round-trip pipeline (Arms A/B + ballistic only,
+  `per_model=None`/no renderer needed) with finiteness and determinism
+  checks; `ArmAccumulator`/`aggregate_results` shape and finiteness checks;
+  the attribution plot (incl. an empty-curve arm, e.g. Arm C with no
+  perception model at all).
+- GPU (`tests/test_closed_loop_gpu.py`, 1 test, gpu-marked): the full CLI
+  end-to-end against the real `runs/dynamics-v1` + `runs/perception-v3-cnn`
+  checkpoints and 3 real `perception-v1` test episodes -- asserts exit 0,
+  every reported metric finite, every emitted GLB (`gt`/`armA`/`armB`/`armC`)
+  passes `gltfworld validate` with 0 errors, and the `A <= C` sanity
+  direction at `h=30` (see the finding above for why this test does *not*
+  additionally assert the full `A <= B <= C` ordering).
+
+### Acceptance (see `docs/VERIFICATION.md`'s V7 section for exact commands)
+
+Closed loop runs end-to-end via real glTF at every hop; `attribution.png` is
+produced; every emitted GLB validates clean. Full-scale (20-episode)
+arm-ordering sanity and the attribution curve's final shape are the
+orchestrator's to run with the eventual `perception-v4-cnn-40k` checkpoint,
+per this milestone's own scope boundary (deliver + smoke-test the closed
+loop here, same precedent V5/V6 established for their own full training/eval
+runs).

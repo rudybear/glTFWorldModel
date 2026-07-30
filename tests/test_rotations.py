@@ -17,6 +17,7 @@ from gltfworld.models.rotations import (
     quat_multiply,
     quat_normalize,
     quat_to_6d,
+    quat_to_axis_angle,
     quat_to_matrix,
     rotation_6d_to_matrix,
     sixd_to_quat,
@@ -164,3 +165,58 @@ def test_geodesic_angle_gradient_finite_near_zero():
     angle = quat_geodesic_angle(q1, q2)
     angle.sum().backward()
     assert torch.isfinite(q1.grad).all()
+
+
+# --- quat_to_axis_angle (log map): round trip + scipy cross-check -------------
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_quat_to_axis_angle_matches_scipy(seed):
+    rng = np.random.default_rng(seed)
+    axes = rng.normal(size=(200, 3))
+    axes /= np.linalg.norm(axes, axis=-1, keepdims=True)
+    # keep angles within [0, pi] (the principal range quat_to_axis_angle
+    # returns after hemisphere normalization) so scipy's own rotvec -- which
+    # has no such canonicalization -- is directly comparable.
+    angles = rng.uniform(0.0, np.pi, size=(200, 1))
+    rotvec = axes * angles
+
+    q = Rotation.from_rotvec(rotvec).as_quat()
+    got = quat_to_axis_angle(torch.from_numpy(q)).numpy()
+    np.testing.assert_allclose(got, rotvec, atol=1e-6)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_quat_to_axis_angle_round_trips_with_exp_map(seed):
+    rng = np.random.default_rng(seed)
+    axes = rng.normal(size=(200, 3))
+    axes /= np.linalg.norm(axes, axis=-1, keepdims=True)
+    angles = rng.uniform(0.0, np.pi, size=(200, 1))  # principal range only
+    rotvec = torch.from_numpy(axes * angles)
+
+    q = axis_angle_to_quat(rotvec)
+    back = quat_to_axis_angle(q)
+    np.testing.assert_allclose(back.numpy(), rotvec.numpy(), atol=1e-6)
+
+    # and the other composition: quat -> rotvec -> quat reproduces the
+    # original (hemisphere-normalized) quaternion.
+    q2 = _hemisphere(_random_quats(200, seed + 500))
+    r2 = quat_to_axis_angle(torch.from_numpy(q2))
+    back_q = quat_hemisphere(axis_angle_to_quat(r2)).numpy()
+    np.testing.assert_allclose(back_q, q2, atol=1e-6)
+
+
+def test_quat_to_axis_angle_small_angle_stable():
+    q = torch.tensor(
+        [[0.0, 0.0, 0.0, 1.0], [1e-9, 0.0, 0.0, 1.0], [1e-6, -1e-6, 2e-6, 1.0]]
+    )
+    q = quat_normalize(q)
+    r = quat_to_axis_angle(q)
+    assert torch.isfinite(r).all()
+    np.testing.assert_allclose(r[0].numpy(), [0.0, 0.0, 0.0], atol=1e-9)
+
+
+def test_quat_to_axis_angle_identity_is_zero():
+    q = torch.tensor([0.0, 0.0, 0.0, 1.0])
+    r = quat_to_axis_angle(q)
+    np.testing.assert_allclose(r.numpy(), [0.0, 0.0, 0.0], atol=1e-12)

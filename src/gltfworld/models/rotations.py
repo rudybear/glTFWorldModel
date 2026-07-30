@@ -108,6 +108,39 @@ def axis_angle_to_quat(r: torch.Tensor, eps: float = _EPS) -> torch.Tensor:
     return torch.cat([xyz, w], dim=-1)
 
 
+def quat_to_axis_angle(q: torch.Tensor, eps: float = _EPS) -> torch.Tensor:
+    """Logarithmic map, the inverse of :func:`axis_angle_to_quat`: unit
+    quaternion ``q`` (..., 4) xyzw -> rotation vector ``r`` (..., 3)
+    (axis * angle, radians).
+
+    ``q`` is hemisphere-normalized first (``w >= 0``), which pins ``theta``
+    (``= ||r||``) to the principal range ``[0, pi]`` -- the minimal rotation
+    angle representing ``q``, not the "other way around" ``2*pi - theta``
+    cover. ``theta = 2 * atan2(||xyz||, w)`` (well-behaved for any ``w``,
+    unlike ``2 * arccos(w)`` whose derivative blows up as ``w -> +-1``, the
+    same reason ``quat_geodesic_angle`` avoids ``arccos``); ``axis = xyz /
+    ||xyz||``, recovered stably at ``theta -> 0`` via a Taylor expansion of
+    ``theta / sin(theta/2)`` (which has a well-defined ``-> 2`` limit, not a
+    ``0/0`` singularity) rather than dividing by a clamped-away-from-zero
+    ``||xyz||`` directly -- the same style :func:`axis_angle_to_quat` itself
+    uses for its own small-angle branch. Cross-checked against
+    ``scipy.spatial.transform.Rotation.as_rotvec()`` and as an exact
+    round-trip partner of :func:`axis_angle_to_quat` in
+    ``tests/test_rotations.py``.
+    """
+    q = quat_hemisphere(quat_normalize(q, eps=eps))
+    xyz = q[..., 0:3]
+    w = q[..., 3:4].clamp(min=-1.0, max=1.0)
+    sin_half = torch.linalg.norm(xyz, dim=-1, keepdim=True)
+    theta = 2.0 * torch.atan2(sin_half, w)
+    small = theta < eps
+    safe_sin_half = torch.where(small, torch.ones_like(sin_half), sin_half)
+    # theta / sin(theta/2) = 2 + theta^2/12 + O(theta^4) as theta -> 0.
+    small_coeff = 2.0 + (theta * theta) / 12.0
+    coeff = torch.where(small, small_coeff, theta / safe_sin_half)
+    return xyz * coeff
+
+
 # --- quaternion <-> rotation matrix -------------------------------------------
 
 

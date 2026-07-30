@@ -1083,3 +1083,197 @@ than hidden or silently re-tuned away.
   pushed**, so this remains unverified against a live GitHub Actions run
   until a future push, exactly as V4/V5 recorded honestly for their own
   unpushed commits.
+
+## V7 -- closed-loop demo + attribution
+
+Needs the `ml` + `render` extras (no new dependencies -- `scipy.stats.chi`
+reuses the same `scipy` already synced for V5/V6; everything else is code
+already in this project). The end-to-end GPU checkpoint additionally needs
+real assets: `data/perception-v1/{episodes,packed}`, `runs/dynamics-v1/
+best.safetensors`, `runs/perception-v3-cnn/best.safetensors` + its
+`eval/metrics.json`. See DESIGN.md's "Closed-loop demo + attribution (V7)"
+section for the full three-arm design/correspondence-method writeup this
+section verifies against.
+
+### Checkpoint: log-map utility (`quat_to_axis_angle`), the correctness-critical new primitive
+
+- **Purpose**: Arm B/C's finite-difference velocity assembly needs a
+  quaternion -> rotation-vector log map that didn't exist before this
+  milestone (`gltfworld.models.rotations` only had the exponential-map
+  direction, `axis_angle_to_quat`). Confirm it matches `scipy.spatial
+  .transform.Rotation.as_rotvec()` on random rotations in the principal
+  `[0, pi]` range, round-trips exactly with `axis_angle_to_quat` in both
+  compositions, is numerically stable at `theta -> 0`, and maps the identity
+  quaternion to the zero vector.
+- **Command**: `uv run pytest tests/test_rotations.py -v -k axis_angle`
+- **Expected result**: all 8 new tests pass (subset of the module's 37, up
+  from 29 pre-V7). Observed: **8/8 pass**.
+
+### Checkpoint: pure arm-assembly logic (CPU, no ckpt/GPU needed)
+
+- **Purpose**: confirm the noise-injection/finite-diff/matching primitives
+  underneath all 3 arms are correct in isolation, independent of any trained
+  model: injected Gaussian noise (position + per-shape rotation) matches its
+  requested sigma empirically (n=20,000, within 5%); zero noise reproduces
+  the GT state exactly; the same seed reproduces the same draw; Arm B's
+  physics-material fields stay untouched by noise; `finite_diff_velocity`
+  recovers a known constant linear/angular velocity from two analytically
+  constructed frames; **the milestone's own stated exactness bar** -- Arm C
+  with a synthetic *perfect* detector (exact GT position/quat/size/shape/
+  class, existence=1 at both frames) and zero Arm B noise reproduces Arm
+  A/GT's state exactly, modulo the one documented exception
+  (mass/friction/restitution default to fixed constants since
+  `PerceptionDETR` never predicts them -- the test fixture's GT physics
+  fields are constructed to already equal those defaults, making the
+  comparison exact rather than approximate); a zero-detections degenerate
+  case (`n_correspondence == 0`) produces an empty, not crashing, assembly;
+  `hungarian_match`-based cross-frame correspondence recovers the obviously-
+  correct pairing on a hand-built 2-object case (incl. an empty-input case);
+  the exact chi(3) noise-calibration inversion against a synthetic
+  `metrics.json` (and the `--noise-sigma-*` CLI-args-only construction);
+  dataset resolution (`resolve_episodes_dir`) across all 3 accepted input
+  shapes (raw glb dir, dataset root with `episodes/`+`packed/`, bare packed
+  dir/file via `pack_meta.json`'s `source_dir`); deterministic split
+  filtering (`select_episodes` against `gltfworld.data.pack
+  .split_id_for_seed`, the same scheme every packed dataset in this project
+  uses); the full `process_episode` pipeline (Arms A/B + ballistic only,
+  `per_model=None`/no renderer) -- glTF emitted under `gt/armA/armB`, each
+  round-trip-asserted inline, finite states, and determinism given a fixed
+  seed; `ArmAccumulator`/`aggregate_results` shape/finiteness (incl. an
+  all-empty Arm C when no perception model ran, and the `ordering_check`
+  dict's shape); the attribution plot (incl. an arm with an empty curve).
+- **Command**: `uv run pytest tests/test_closed_loop.py -v`
+- **Expected result**: all 24 tests pass. Observed: **24/24 pass**.
+
+### Checkpoint: full test suite (fast lane)
+
+- **Purpose**: confirm this milestone didn't regress anything upstream.
+- **Command**: `uv run pytest -v -m "not gpu"`
+- **Expected result / observed**: **248 passed, 14 deselected** (not-gpu; up
+  from V6's 197/13 -- `tests/test_closed_loop.py` is new (24 CPU-fast
+  tests), `tests/test_rotations.py` gained 8 tests for the new
+  `quat_to_axis_angle` log map, and `tests/test_closed_loop_gpu.py`'s single
+  gpu-marked test raises the deselected count by 1).
+
+### Checkpoint: closed-loop CLI end-to-end (gpu, real checkpoints + 3 real episodes)
+
+- **Purpose**: confirm the full CLI runs end-to-end against real data and
+  real, trained checkpoints -- render GT frames 0/1, run the real
+  `PerceptionDETR` (CNN encoder, `perception-v3-cnn`), Hungarian-match
+  detections across frames, roll forward with the real `InteractionTransformer`
+  (`dynamics-v1`), save every arm as glTF, reload, and score -- producing
+  finite metrics and a clean pass through the real, pinned glTF-Validator
+  for every emitted GLB. **Not** a claim about the attribution curve's shape
+  at scale (3 episodes; see the acceptance section below and DESIGN.md's V7
+  section for a real, honestly-reported finding from this exact run about
+  `A <= B <= C` ordering not holding at every horizon at this sample size).
+- **Command**:
+
+  ```bash
+  uv run pytest tests/test_closed_loop_gpu.py -v -m gpu -s
+  ```
+
+  or directly:
+
+  ```bash
+  uv run python -m gltfworld.eval.closed_loop \
+      --episodes data/perception-v1 \
+      --dyn-ckpt runs/dynamics-v1/best.safetensors \
+      --per-ckpt runs/perception-v3-cnn/best.safetensors \
+      --per-metrics runs/perception-v3-cnn/eval/metrics.json \
+      --out runs/closed-loop-smoke --n-episodes 3 --split test \
+      --horizons 1 5 10 30 --video 0
+  ```
+
+- **Expected result / observed**: exit 0; writes `metrics.json` and
+  `attribution.png`; every metric in `metrics.json` finite (`n=0` groups
+  report `median: null`, expected); every emitted GLB across
+  `gt/armA/armB/armC` (9 total for 3 episodes -- Arm C's count depends on
+  whether any correspondence survived, which it did for all 3 here) passes
+  `gltfworld validate` with 0 errors. Measured median position error at
+  each horizon (this machine, `runs/dynamics-v1` + `runs/perception-v3-cnn`,
+  seed 0):
+
+  | arm | h=1 | h=5 | h=10 | h=30 |
+  | --- | --- | --- | --- | --- |
+  | A (oracle) | 0.0049 | 0.0199 | 0.0254 | 0.1244 |
+  | B (oracle+noise) | 0.2329 | 0.9162 | 1.5404 | 3.3760 |
+  | C (visual) | 0.5170 | 0.6262 | 0.7083 | 0.8259 |
+  | ballistic | 0.0053 | 0.0267 | 0.0534 | 4.6160 |
+
+  detection stats: `tp=10, fp=0, fn=1` (precision 1.0, recall 0.909, F1
+  0.952) over the 3 episodes' correspondence-surviving objects.
+
+  **`A <= C` holds at every horizon** (the test's own asserted sanity
+  direction), but **`A <= B <= C` does not** at `h=5/10/30` -- Arm B
+  diverges *faster* than Arm C. This is reported, not hidden or re-tuned
+  away (see DESIGN.md's V7 section for the full explanation: Arm B's i.i.d.-
+  per-frame Gaussian noise model, once finite-differenced over a small
+  `dt`, implies a very large injected velocity noise, while the real
+  detector's actual per-frame errors are apparently more correlated
+  frame-to-frame than an i.i.d. model assumes and partially cancel in the
+  finite difference instead). Only 3 episodes were run here; the
+  orchestrator's full 20-episode run (with the eventual
+  `perception-v4-cnn-40k` checkpoint) is the statistically meaningful
+  version of this same measurement.
+
+### Checkpoint: `--video` path (gpu, manual spot-check)
+
+- **Purpose**: confirm the 2-panel (`GT | Arm C`) and 3-panel (`GT | Arm A |
+  Arm C`) mp4 export works end-to-end (reuses `gltfworld.eval.rollout
+  ._render_side_by_side_videos`'s exact renderer/imageio pattern).
+- **Command**:
+
+  ```bash
+  uv run python -m gltfworld.eval.closed_loop \
+      --episodes data/perception-v1 --dyn-ckpt runs/dynamics-v1/best.safetensors \
+      --per-ckpt runs/perception-v3-cnn/best.safetensors \
+      --per-metrics runs/perception-v3-cnn/eval/metrics.json \
+      --out /tmp/cl-video-check --n-episodes 1 --video 1
+  ```
+
+- **Expected result / observed**: exits 0; writes `video/ep_XXXXXX.mp4`
+  (21,311 bytes) and `video/ep_XXXXXX_3panel.mp4` (29,444 bytes) on this
+  machine -- not wired into the automated gpu-marked test suite (a manual
+  spot-check only, to keep the automated gpu lane's runtime bounded per this
+  session's "keep GPU usage light" constraint; the 3-episode end-to-end
+  checkpoint above already exercises every other real hop, including Arm C's
+  renderer use for perception, without paying for full-episode video
+  rendering 3x per episode).
+
+### Checkpoint: full test suite (gpu lane)
+
+- **Purpose**: confirm this milestone's new gpu-marked test runs cleanly
+  alongside every pre-existing gpu-marked test (no regression from the new
+  `quat_to_axis_angle` addition or `closed_loop.py`'s reuse of
+  `EpisodeRenderer`/`PerceptionDETR`/`InteractionTransformer`).
+- **Command**: `uv run pytest -v -m gpu`
+- **Expected result / observed**: full gpu lane green, `tests/
+  test_closed_loop_gpu.py`'s new test included; run once this session per
+  the "run the gpu lane once, keep it brief" instruction.
+
+### Checkpoint: CI / new dependencies
+
+- **Purpose**: confirm this milestone didn't need any new dependency or CI
+  workflow change.
+- **Finding**: no new dependency was added (`scipy.stats.chi` reuses the
+  `ml` extra's existing `scipy`). Per this milestone's own rules, **no
+  commit here is pushed**, so this remains unverified against a live GitHub
+  Actions run until a future push, exactly as V4/V5/V6 recorded honestly for
+  their own unpushed commits.
+
+### Acceptance (see DESIGN.md's "Closed-loop demo + attribution (V7)" section)
+
+Closed loop runs end-to-end via real glTF at every hop (every arm's rollout
+saved -> reloaded -> round-trip-asserted `<= 1e-6` before scoring);
+`attribution.png` produced; every emitted GLB validates clean. Arm ordering
+sanity (`A <= B <= C` at long horizons, allowing statistical noise) is
+**reported, not gated** -- per this exact requirement, the 3-episode GPU
+smoke's finding that `A <= C` holds but the full `A <= B <= C` chain does
+not at `h >= 5` is recorded above and in DESIGN.md as a real finding, not
+silently passed over. Full-scale (20-episode) confirmation of whether this
+pattern holds at a statistically meaningful sample size, and with the
+eventual `perception-v4-cnn-40k` checkpoint, is the orchestrator's to run
+separately, per this milestone's own scope boundary (deliver + smoke-test
+the closed loop here, the same precedent V5/V6 established for their own
+full training/eval runs).
