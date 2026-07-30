@@ -115,3 +115,86 @@ def test_param_count_reported_and_reasonable():
     # gross architecture regression (e.g. an accidentally-untied huge layer)
     # would still fail loudly.
     assert 3_000_000 <= n <= 30_000_000, f"param count {n:,} looks implausible for this architecture"
+
+
+# --- V6.3: CNN encoder option --------------------------------------------------
+
+
+def test_cnn_encoder_rejects_unknown_encoder():
+    try:
+        PerceptionDETR(encoder="resnet50")
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_cnn_encoder_forward_output_shapes_and_finite():
+    model = PerceptionDETR(encoder="cnn")
+    model.eval()
+    rgb = torch.rand(4, 256, 256, 3)
+    with torch.no_grad():
+        out = model(rgb)
+
+    assert out["existence_logit"].shape == (4, N_MAX)
+    assert out["position"].shape == (4, N_MAX, 3)
+    assert out["quat"].shape == (4, N_MAX, 4)
+    assert out["size"].shape == (4, N_MAX, 3)
+    assert out["shape_logits"].shape == (4, N_MAX, NUM_SHAPES)
+    assert out["class_logits"].shape == (4, N_MAX, NUM_CLASSES)
+
+    for v in out.values():
+        assert torch.isfinite(v).all()
+
+
+def test_cnn_encoder_quat_unit_and_bounds_respected():
+    model = PerceptionDETR(encoder="cnn")
+    model.eval()
+    rgb = torch.rand(3, 256, 256, 3)
+    with torch.no_grad():
+        out = model(rgb)
+
+    norms = torch.linalg.norm(out["quat"], dim=-1)
+    np.testing.assert_allclose(norms.numpy(), np.ones((3, N_MAX)), atol=1e-5)
+    assert (out["quat"][..., 3] >= -1e-6).all()
+
+    pos = out["position"].numpy()
+    for i, (lo, hi) in enumerate(zip(POS_MIN, POS_MAX)):
+        assert (pos[..., i] >= lo - 1e-4).all()
+        assert (pos[..., i] <= hi + 1e-4).all()
+
+    size = out["size"].numpy()
+    assert (size >= SIZE_MIN - 1e-6).all()
+    assert (size <= SIZE_MAX + 1e-6).all()
+
+
+def test_cnn_encoder_batch_independence():
+    model = PerceptionDETR(encoder="cnn")
+    model.eval()
+    torch.manual_seed(42)
+    rgb = torch.rand(3, 256, 256, 3)
+    with torch.no_grad():
+        out_batched = model(rgb)
+        out_single = model(rgb[1:2])
+
+    np.testing.assert_allclose(
+        out_batched["position"][1].numpy(), out_single["position"][0].numpy(), atol=1e-5
+    )
+
+
+def test_cnn_encoder_param_count_in_target_band():
+    """V6.3 target: the CNN-encoder variant's *total* parameter count (CNN
+    encoder + existing decoder/heads, unchanged) lands in the 6-12M band --
+    see gltfworld.models.perception's module docstring V6.3 section."""
+    model = PerceptionDETR(encoder="cnn")
+    n = count_params(model)
+    assert 6_000_000 <= n <= 12_000_000, f"CNN-encoder param count {n:,} outside the 6-12M target band"
+
+
+def test_vit_default_param_count_unchanged():
+    """encoder='vit' must remain exactly what it was before V6.3 -- the
+    measured count recorded in DESIGN.md's V6 section."""
+    model = PerceptionDETR()  # default encoder="vit"
+    assert model.encoder_type == "vit"
+    n = count_params(model)
+    assert n == 8_234_259, f"vit-encoder param count changed: {n:,} (expected 8,234,259 unchanged)"

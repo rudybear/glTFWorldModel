@@ -1170,3 +1170,84 @@ pose supervision. `gltfworld.data.pack.pack_dataset` also reports the
 per-split fraction (printed, and recorded in `pack_meta.json`'s
 `workspace_filter` field) so the defect's scale stays visible independent
 of any particular training/eval run.
+
+### V6.3: CNN encoder option (small-data regime)
+
+**Rationale.** V6.1/V6.2 established, with real evidence rather than a
+guess, that the `vit` encoder's problem is data-hunger, not a broken
+pathway: the full 25k-step run on the (correctly-sized, defect-fixed)
+4,000-episode `perception-v1` pack reached only **0.461m** median val
+position error against the milestone's **0.05m** bar, with a persistent
+train/val gap (0.61 train vs. 2.34 val loss) even after the dataset-scale
+guard and out-of-box-GT fixes landed; an 8-frame overfit test converges to
+0.05-0.09m and position gets 32% of the trunk's gradient norm (the
+decoder/heads/loss pathway is healthy); shape/class heads *do* generalize
+(0.875 vs. a 0.40 trivial baseline). A from-scratch `nn.TransformerEncoder`
+over raw image patches has no built-in spatial prior -- no locality, no
+translation equivariance -- and has to learn one from data alone; a
+from-scratch CNN gets both for free from its architecture. This is the
+textbook fix for "transformer generalizes too slowly in a small-data
+regime": swap in a convolutional inductive bias rather than trying to make
+the transformer work harder on the same data.
+
+**Architecture** (`gltfworld.models.perception`, `encoder="cnn"` option on
+`PerceptionDETR`, default remains `encoder="vit"`, unchanged): a stride-1
+stem (`3 -> 32` channels) + 4 stride-2 stages (output channels 32/64/128/256,
+`GroupNorm` + `SiLU` after every conv, plain stacked conv blocks -- no
+residual connections, not architecturally required by this fix), taking
+`256x256` down to a `16x16x256` feature map (4 halvings: `256/2**4 == 16`,
+matching the `vit` path's 256-token patch grid exactly), a `1x1` conv
+projecting to `d_model=256` tokens, plus a learned per-token 2D positional
+embedding. That token sequence feeds the *existing* decoder (3 layers, 5
+queries) and heads *unchanged* -- no transformer self-attention over image
+tokens in this path at all; the convnet's own stacked local receptive fields
+do the spatial mixing instead. Per-stage depth
+(`CNN_BLOCKS_PER_STAGE = (2, 2, 3, 5)`) is not architecturally load-bearing;
+it is tuned only to land the whole model's parameter count in the milestone's
+6-12M target band. Measured (`python -m gltfworld.models.perception`, this
+machine): **6,467,219** parameters (`encoder="cnn"`) vs. **8,234,259**
+(`encoder="vit"`, unchanged from V6).
+
+**Config**: `configs/perception_v2_cnn.json` -- an exact copy of
+`configs/perception_v1.json` with `"encoder": "cnn"` added; same 25k steps,
+batch 128, losses, and augmentation, so any difference in outcome is
+attributable to the encoder swap alone, not a confounded config change.
+
+**Tests** (`tests/test_perception_model.py`): forward shape/finiteness,
+quaternion unit-norm, and workspace-bound checks for `encoder="cnn"`
+(mirroring the existing `vit` tests), batch independence, an encoder-name
+validation test (`ValueError` on an unknown encoder string), the 6-12M
+param-count band, and a pinned exact-count regression test for
+`encoder="vit"` (`8_234_259`, unchanged) so this milestone can't silently
+regress the existing model while adding the new option.
+
+**`--smoke-val` result on `configs/perception_v2_cnn.json`** (this session,
+same recalibrated V6.2 criteria: >= 15% relative improvement in val
+`matched_pos_err` from step 500 to the final step, AND final value < 0.55m;
+~5,000 steps, ~1.8 epoch-equivalents on the 4,000-episode pack -- reported
+honestly, not tuned to pass). Full per-500-step trajectory (val
+`matched_pos_err`, this machine, RTX PRO 6000 Blackwell, 2332.5s total):
+
+| step | 500 | 1000 | 1500 | 2000 | 2500 | 3000 | 3500 | 4000 | 4500 | 5000 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| val matched_pos_err (m) | 0.6326 | 0.5322 | 0.4599 | 0.4214 | 0.3863 | 0.3578 | 0.3401 | 0.3060 | 0.3038 | 0.2858 |
+
+Step-500 -> step-5000 relative improvement: **54.8%** (needs >= 15%); final
+value **0.2858m** (needs < 0.55m). **`--smoke-val` PASSED both conditions.**
+The curve is monotonically declining at every single evaluation, with no
+plateau -- a qualitatively different shape from the `vit` encoder's mostly-flat
+0.62-0.66m plateau over the identical step budget/dataset/schedule/loss (V6.2
+postmortem above: 7.7% relative improvement, final 0.5958m, **failed** both
+conditions). This is a real, favorable within-budget comparison, not just a
+passed threshold: same data, same 5,000-step window, only the encoder
+differs.
+
+This result is also independent evidence for the V6.2 bound: the CNN
+encoder generalizes measurably faster and further than `vit` did over the
+exact same short window, on the same data, same schedule, same loss --
+consistent with the rationale above (built-in convolutional inductive bias
+needs less data to start generalizing than a from-scratch transformer
+encoder does). Per this milestone's own scope boundary, the full 25k-step
+run against `perception_v2_cnn.json` -- the only way to confirm whether this
+early trend holds all the way to the milestone's 0.05m acceptance bar -- is
+the orchestrator's to launch separately, not run here.

@@ -124,6 +124,9 @@ class Config:
     dec_layers: int = 3
     n_heads: int = 8
     mlp_ratio: int = 4
+    # "vit" (default, unchanged) or "cnn" (V6.3 small-data-regime encoder --
+    # see gltfworld.models.perception's module docstring V6.3 section)
+    encoder: str = "vit"
 
     # optimization
     seed: int = 0
@@ -275,6 +278,7 @@ def make_model(cfg: Config) -> PerceptionDETR:
         dec_layers=cfg.dec_layers,
         n_heads=cfg.n_heads,
         mlp_ratio=cfg.mlp_ratio,
+        encoder=cfg.encoder,
     )
 
 
