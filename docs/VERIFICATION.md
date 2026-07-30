@@ -883,7 +883,7 @@ verifies against.
   rotation loss is exactly 0 regardless of how different the predicted and
   GT quaternions are.
 - **Command**: `uv run pytest tests/test_matching.py -v`
-- **Expected result**: all 16 tests pass. Observed: **16/16 pass**.
+- **Expected result**: all 23 tests pass. Observed: **23/23 pass**.
 
 ### Checkpoint: Hungarian matching correctness (incl. distractor queries)
 
@@ -893,7 +893,7 @@ verifies against.
   2 far-away distractor queries that must end up unmatched; confirm a
   frame with 0 real GT objects returns an empty match with no error.
 - **Command**: `uv run pytest tests/test_matching.py -k hungarian -v`
-- **Expected result**: 2/2 pass (subset of the 16 above).
+- **Expected result**: subset of the 23 above pass.
 
 ### Checkpoint: model shapes/finiteness + parameter count
 
@@ -1047,13 +1047,17 @@ verifies against.
 ### Acceptance (see DESIGN.md's "Perception model (V6)" section)
 
 On the `perception-v1` test split: existence F1 >= 0.95, median matched
-position error <= 0.05 m, class accuracy >= 0.95. **Not yet measured against
-a fully-trained checkpoint** -- per this milestone's own scope boundary
-(training code delivered + smoke-tested here; the full 25k-step run is the
-orchestrator's to execute separately, exactly like V5's dynamics model). If
-the trained model's numbers miss this bar once the full run completes, that
-finding is to be reported honestly and recorded in `docs/RESULTS.md` rather
-than hidden or silently re-tuned away.
+position error <= 0.05 m, class accuracy >= 0.95. **Measured against the
+trained CNN encoder checkpoint** (see `docs/RESULTS.md` V6 section for the final
+numbers): acceptance bar **NOT met** (existence F1 0.8701 < 0.95; median position
+error 0.1798 m >> 0.05 m; class accuracy 0.9496 ≈ 0.95). The postmortem and
+recovery findings (ViT memorization, dataset-scale guard, out-of-box GT filter,
+CNN encoder swap) are documented in `docs/RESULTS.md` V6 section and DESIGN.md
+sections V6.1-V6.3.
+
+### Observed (final, V6)
+
+Trained `perception-v4-cnn-40k` checkpoint (40k steps with CNN encoder on 4k-episode dataset) evaluated on test split: existence F1 **0.8701** (target ≥ 0.95), median matched position error **0.1798 m** (target ≤ 0.05 m), class accuracy **0.9496** (target ≥ 0.95). Position signal is real and grounded (4.3× better than mean-state baseline at 0.7732 m). Validation curve plateaued around step 40k at 0.155 m, suggesting dataset size remains limiting factor for sub-5cm accuracy.
 
 ### Checkpoint: full test suite
 
@@ -1105,7 +1109,7 @@ section verifies against.
   `[0, pi]` range, round-trips exactly with `axis_angle_to_quat` in both
   compositions, is numerically stable at `theta -> 0`, and maps the identity
   quaternion to the zero vector.
-- **Command**: `uv run pytest tests/test_rotations.py -v -k axis_angle`
+- **Command**: `uv run pytest tests/test_rotations.py -v -k quat_to_axis_angle`
 - **Expected result**: all 8 new tests pass (subset of the module's 37, up
   from 29 pre-V7). Observed: **8/8 pass**.
 
@@ -1149,11 +1153,11 @@ section verifies against.
 
 - **Purpose**: confirm this milestone didn't regress anything upstream.
 - **Command**: `uv run pytest -v -m "not gpu"`
-- **Expected result / observed**: **248 passed, 14 deselected** (not-gpu; up
+- **Expected result / observed**: **248 passed, 15 deselected** (not-gpu; up
   from V6's 197/13 -- `tests/test_closed_loop.py` is new (24 CPU-fast
   tests), `tests/test_rotations.py` gained 8 tests for the new
   `quat_to_axis_angle` log map, and `tests/test_closed_loop_gpu.py`'s single
-  gpu-marked test raises the deselected count by 1).
+  gpu-marked test raises the deselected count by 2).
 
 ### Checkpoint: closed-loop CLI end-to-end (gpu, real checkpoints + 3 real episodes)
 
@@ -1277,3 +1281,7 @@ eventual `perception-v4-cnn-40k` checkpoint, is the orchestrator's to run
 separately, per this milestone's own scope boundary (deliver + smoke-test
 the closed loop here, the same precedent V5/V6 established for their own
 full training/eval runs).
+
+### Observed (final, V7)
+
+Closed-loop demo on 20 test-split episodes with `perception-v4-cnn-40k` CNN encoder + `dynamics-v1` transformer: Arm A (oracle) baseline, Arm B (oracle + chi(3)-calibrated noise) upper bound on i.i.d.-measurement-noise cost, Arm C (real closed loop) shows **1.62 m position error at h=99** vs. ballistic's **55.5 m** (34× improvement). Key findings: (1) detector errors are frame-correlated (lag-1 autocorrelation 0.55–0.82), causing naive i.i.d.-noise model (Arm B) to diverge 17× faster than real detector (Arm C) at h=99; (2) learned dynamics keeps imperfect perceptual observations physically plausible. Attribution curve, per-arm trajectory metrics, and real glTF at every hop archived in `runs/closed-loop-v1/`.

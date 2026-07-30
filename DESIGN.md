@@ -1256,6 +1256,10 @@ run against `perception_v2_cnn.json` -- the only way to confirm whether this
 early trend holds all the way to the milestone's 0.05m acceptance bar -- is
 the orchestrator's to launch separately, not run here.
 
+### V6 final outcome (40k steps, CNN encoder, 4k-episode dataset)
+
+The orchestrator's full 40k-step run on `perception-v4-cnn-40k` reached convergence with the CNN encoder on the corrected, 4k-episode dataset. **Acceptance bar NOT met**: existence F1 **0.8701** (< 0.95 bar), median matched position error **0.1798 m** (>> 0.05 m target, 3.6× over), class accuracy **0.9496** (≈ 0.95). The CNN encoder resolved the ViT memorization crisis and validated the data-hunger diagnosis (monotonic 54.8% position-error improvement vs. ViT's flat 7.7% at 5k steps), and position signal is genuine (4.3× baseline). Validation curves plateau around step 40k at 0.155 m, indicating the 4,000-episode dataset, while large enough to defeat memorization, remains insufficient for the sub-5cm closed-loop acceptance bar — a measurable, honest outcome that feeds forward into the V7 closed-loop analysis and gap-report calibration.
+
 ## Closed-loop demo + attribution (V7)
 
 `gltfworld.eval.closed_loop` is the flagship artifact this project's whole
