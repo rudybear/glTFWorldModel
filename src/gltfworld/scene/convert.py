@@ -31,11 +31,163 @@ from gltfworld.ext import khr_physics, rwm
 from gltfworld.gltf.accessors import BufferAccumulator, read_accessor
 from gltfworld.scene.episode import Episode, StateSeries
 from gltfworld.scene.primitives import mesh_for
-from gltfworld.scene.scene import CameraSpec, LightSpec, ObjectSpec, SceneState
+from gltfworld.scene.scene import ArticulatedSpec, CameraSpec, LightSpec, ObjectSpec, SceneState
 
 EXT_LIGHTS_PUNCTUAL = "KHR_lights_punctual"
 
 GENERATOR = "gltfworld"
+
+
+# --- V9-prep: articulated joint pivots -----------------------------------------
+#
+# See gltfworld.ext.khr_physics's module docstring ("V9-prep: joints") for
+# why each articulation gets one motion-less, geometry-less "joint pivot"
+# child node per side (base/part), both placed at ArticulatedSpec.anchor in
+# their own body's local frame: that's what makes the pinned spec's
+# attachment-frame rule ("relative transform between the node and the first
+# parent motion, or the fixed reference frame if none") land exactly on the
+# shared physical hinge/slide point, rather than approximating it.
+
+
+def _quat_conj_xyzw(q: np.ndarray) -> np.ndarray:
+    x, y, z, w = (float(v) for v in q)
+    return np.array([-x, -y, -z, w], dtype=np.float64)
+
+
+def _quat_rotate_xyzw(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vector ``v`` (3,) by unit quaternion ``q`` (4,) xyzw."""
+    q = np.asarray(q, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    qv = q[0:3]
+    w = q[3]
+    t = 2.0 * np.cross(qv, v)
+    return v + w * t + np.cross(qv, t)
+
+
+def _world_to_local_offset(world_point: np.ndarray, body_pos: np.ndarray, body_rot_xyzw: np.ndarray) -> np.ndarray:
+    """``world_point`` expressed in ``body``'s own local frame (its inverse
+    rotation applied to the world-space offset from its origin)."""
+    offset_world = np.asarray(world_point, dtype=np.float64) - np.asarray(body_pos, dtype=np.float64)
+    return _quat_rotate_xyzw(_quat_conj_xyzw(body_rot_xyzw), offset_world)
+
+
+def _add_articulation_pivots(
+    gltf: pygltflib.GLTF2,
+    scene: SceneState,
+    series,
+    node_index_by_object_id: dict[int, int],
+) -> list[tuple[ArticulatedSpec, int, int]]:
+    """Add one motion-less "joint pivot" child node per side (base/part) for
+    every ``scene.articulations`` entry; nests each under its owning
+    object's node (``node.children``). Returns
+    ``[(articulation, base_pivot_node_index, part_pivot_node_index), ...]``
+    for the caller to turn into KHR joint dicts once the physics doc exists.
+    """
+    obj_position_by_id = {obj.object_id: i for i, obj in enumerate(scene.objects)}
+    out: list[tuple[ArticulatedSpec, int, int]] = []
+
+    for art in scene.articulations:
+        base_node_index = node_index_by_object_id[art.base_object_id]
+        part_node_index = node_index_by_object_id[art.part_object_id]
+        base_pos0 = series.poses[0, obj_position_by_id[art.base_object_id], 0:3]
+        base_rot0 = series.poses[0, obj_position_by_id[art.base_object_id], 3:7]
+        part_pos0 = series.poses[0, obj_position_by_id[art.part_object_id], 0:3]
+        part_rot0 = series.poses[0, obj_position_by_id[art.part_object_id], 3:7]
+
+        base_local = _world_to_local_offset(art.anchor, base_pos0, base_rot0)
+        part_local = _world_to_local_offset(art.anchor, part_pos0, part_rot0)
+
+        base_pivot = pygltflib.Node(
+            name=f"joint_anchor_base_{art.joint_index}",
+            translation=[float(v) for v in base_local],
+            rotation=[0.0, 0.0, 0.0, 1.0],
+        )
+        gltf.nodes.append(base_pivot)
+        base_pivot_index = len(gltf.nodes) - 1
+
+        part_pivot = pygltflib.Node(
+            name=f"joint_anchor_part_{art.joint_index}",
+            translation=[float(v) for v in part_local],
+            rotation=[0.0, 0.0, 0.0, 1.0],
+        )
+        gltf.nodes.append(part_pivot)
+        part_pivot_index = len(gltf.nodes) - 1
+
+        base_node = gltf.nodes[base_node_index]
+        base_node.children = list(base_node.children or []) + [base_pivot_index]
+        part_node = gltf.nodes[part_node_index]
+        part_node.children = list(part_node.children or []) + [part_pivot_index]
+
+        out.append((art, base_pivot_index, part_pivot_index))
+
+    return out
+
+
+def _compute_scene_roots(gltf: pygltflib.GLTF2) -> list[int]:
+    """Every node index NOT listed as a child of some other node -- the
+    correct ``scenes[0].nodes`` root list once any node (e.g. an
+    articulation joint pivot) is nested under a parent via
+    ``node.children``. Identical to ``list(range(len(gltf.nodes)))`` when
+    nothing has children (every pre-V9 episode)."""
+    child_indices: set[int] = set()
+    for node in gltf.nodes:
+        if node.children:
+            child_indices.update(node.children)
+    return [i for i in range(len(gltf.nodes)) if i not in child_indices]
+
+
+def articulation_to_extras(art: ArticulatedSpec) -> dict:
+    """Raw-dict encoding of one ``ArticulatedSpec``, for ``extras.rwm.articulations``."""
+    return {
+        "joint_index": art.joint_index,
+        "base_object_id": art.base_object_id,
+        "part_object_id": art.part_object_id,
+        "joint_type": art.joint_type,
+        "axis": art.axis,
+        "min": art.min,
+        "max": art.max,
+        "anchor": [float(v) for v in art.anchor],
+        "part_labels": list(art.part_labels),
+        "affordances": list(art.affordances),
+        "handle_object_id": art.handle_object_id,
+        "handle_labels": list(art.handle_labels),
+        "handle_affordances": list(art.handle_affordances),
+        "base_labels": list(art.base_labels),
+    }
+
+
+def articulation_from_extras(d: dict) -> ArticulatedSpec:
+    """Inverse of :func:`articulation_to_extras`."""
+    return ArticulatedSpec(
+        joint_index=d["joint_index"],
+        base_object_id=d["base_object_id"],
+        part_object_id=d["part_object_id"],
+        joint_type=d["joint_type"],
+        axis=d["axis"],
+        min=d["min"],
+        max=d["max"],
+        anchor=np.array(d["anchor"], dtype=np.float32),
+        part_labels=tuple(d.get("part_labels", ())),
+        affordances=tuple(d.get("affordances", ())),
+        handle_object_id=d.get("handle_object_id"),
+        handle_labels=tuple(d.get("handle_labels", ())),
+        handle_affordances=tuple(d.get("handle_affordances", ())),
+        base_labels=tuple(d.get("base_labels", ())),
+    )
+
+
+def _semantics_by_object_id(scene: SceneState) -> dict[int, dict]:
+    """object_id -> ``extras.rwm.semantics`` dict for every base/part/handle
+    object across ``scene.articulations`` (empty for non-articulated scenes)."""
+    out: dict[int, dict] = {}
+    for art in scene.articulations:
+        out[art.base_object_id] = rwm.node_semantics(art.base_labels or ("base",))
+        out[art.part_object_id] = rwm.node_semantics(art.part_labels, art.affordances)
+        if art.handle_object_id is not None:
+            out[art.handle_object_id] = rwm.node_semantics(
+                art.handle_labels or ("handle",), art.handle_affordances
+            )
+    return out
 
 
 # --- encode -------------------------------------------------------------------
@@ -199,7 +351,10 @@ def episode_to_gltf(ep: Episode) -> pygltflib.GLTF2:
     _add_camera_node(gltf, scene.camera)
     _add_light_nodes(gltf, scene.lights)
 
-    gltf.scenes = [pygltflib.Scene(nodes=list(range(len(gltf.nodes))))]
+    # --- V9-prep: articulation joint pivots (see module's top-of-file note) ---
+    articulation_pivots = _add_articulation_pivots(gltf, scene, series, node_index_by_object_id)
+
+    gltf.scenes = [pygltflib.Scene(nodes=_compute_scene_roots(gltf))]
     gltf.scene = 0
 
     # --- animation: one shared time accessor, STEP translation+rotation per object ---
@@ -251,6 +406,19 @@ def episode_to_gltf(ep: Episode) -> pygltflib.GLTF2:
     physics_doc = khr_physics.build_khr_physics(
         scene.objects, node_index_by_object_id, initial_lin_vel, initial_ang_vel
     )
+
+    # --- V9-prep: KHR_physics_rigid_bodies.physicsJoints[] + node.joint ---
+    for art, base_pivot_index, part_pivot_index in articulation_pivots:
+        if art.joint_type == "revolute":
+            limits = khr_physics.hinge_joint_limits(art.axis, art.min, art.max)
+        else:
+            limits = khr_physics.slider_joint_limits(art.axis, art.min, art.max)
+        physics_doc.joints.append(khr_physics.build_joint_dict(limits))
+        joint_array_index = len(physics_doc.joints) - 1
+        physics_doc.node_physics[part_pivot_index] = {
+            "joint": khr_physics.node_joint_property(base_pivot_index, joint_array_index)
+        }
+
     khr_physics.write_khr_physics(gltf, physics_doc)
 
     # --- RWM_state_series (reuses times_accessor) ---
@@ -260,12 +428,24 @@ def episode_to_gltf(ep: Episode) -> pygltflib.GLTF2:
     rwm.write_state_series(gltf, rwm_doc)
 
     # --- extras.rwm ---
+    semantics_by_object_id = _semantics_by_object_id(scene)
     for obj in scene.objects:
         node = gltf.nodes[node_index_by_object_id[obj.object_id]]
-        node.extras["rwm"] = rwm.node_extras(obj.object_id, obj.category, obj.parts, obj.mass, obj.is_static)
+        node.extras["rwm"] = rwm.node_extras(
+            obj.object_id,
+            obj.category,
+            obj.parts,
+            obj.mass,
+            obj.is_static,
+            semantics=semantics_by_object_id.get(obj.object_id),
+        )
 
     gltf.scenes[0].extras["rwm"] = rwm.scene_extras(
-        scene.seed, scene.scene_version, scene.dt, scene.gravity
+        scene.seed,
+        scene.scene_version,
+        scene.dt,
+        scene.gravity,
+        articulations=[articulation_to_extras(a) for a in scene.articulations],
     )
 
     accumulator.finalize(gltf)
@@ -436,6 +616,7 @@ def episode_from_gltf(gltf: pygltflib.GLTF2) -> Episode:
     lights = _decode_light_specs(gltf)
 
     gravity = np.array(scene_extras.get("gravity", [0.0, 0.0, 0.0]), dtype=np.float32)
+    articulations = [articulation_from_extras(d) for d in scene_extras.get("articulations", [])]
     scene_state = SceneState(
         objects=objects,
         camera=camera,
@@ -444,6 +625,7 @@ def episode_from_gltf(gltf: pygltflib.GLTF2) -> Episode:
         dt=scene_extras.get("dt", 0.0),
         seed=scene_extras.get("seed", 0),
         scene_version=scene_extras.get("scene_version", "wm-scenes-v1"),
+        articulations=articulations,
     )
 
     rwm_doc = rwm.read_state_series(gltf)
@@ -462,6 +644,7 @@ def episode_from_gltf(gltf: pygltflib.GLTF2) -> Episode:
         ang_vel=extra_channels.get("ang_vel"),
         actions=extra_channels.get("actions"),
         pose_var=extra_channels.get("pose_var"),
+        joint_pos=extra_channels.get("joint_pos"),
     )
 
     return Episode(scene=scene_state, series=series)

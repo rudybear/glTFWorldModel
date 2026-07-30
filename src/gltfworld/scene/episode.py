@@ -29,6 +29,7 @@ class StateSeries:
     ang_vel: np.ndarray | None = None  # (T, N, 3) float32
     actions: np.ndarray | None = None  # (T, A) float32
     pose_var: np.ndarray | None = None  # (T, N, 7) float32
+    joint_pos: np.ndarray | None = None  # (T, J) float32: radians (revolute) or meters (prismatic)
 
     def __post_init__(self) -> None:
         self.times = _f32(self.times)
@@ -63,6 +64,11 @@ class StateSeries:
                     f"pose_var must have shape (T={t}, N={n}, 7), got {self.pose_var.shape}"
                 )
 
+        if self.joint_pos is not None:
+            self.joint_pos = _f32(self.joint_pos)
+            if self.joint_pos.ndim != 2 or self.joint_pos.shape[0] != t:
+                raise ValueError(f"joint_pos must have shape (T={t}, J), got {self.joint_pos.shape}")
+
     @property
     def num_frames(self) -> int:
         return self.times.shape[0]
@@ -70,6 +76,10 @@ class StateSeries:
     @property
     def num_objects(self) -> int:
         return self.poses.shape[1]
+
+    @property
+    def num_joints(self) -> int:
+        return 0 if self.joint_pos is None else self.joint_pos.shape[1]
 
 
 @dataclass
@@ -83,6 +93,12 @@ class Episode:
         if n_scene != n_series:
             raise ValueError(
                 f"scene declares {n_scene} objects but series carries {n_series}"
+            )
+        n_joints_scene = len(self.scene.articulations)
+        if n_joints_scene != self.series.num_joints:
+            raise ValueError(
+                f"scene declares {n_joints_scene} articulations but series carries "
+                f"{self.series.num_joints} joint_pos columns"
             )
 
     @classmethod

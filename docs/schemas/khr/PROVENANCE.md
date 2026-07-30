@@ -19,6 +19,23 @@ gltfworld implements a subset of these two draft extensions; see
 written, and `DESIGN.md` ("Pinned specs") for the same commit hash recorded
 alongside the transport-encoding writeup.
 
+**V9-prep update (joints)**: the joint-related schema files under
+`physics_rigid_bodies/` --
+`glTF.KHR_physics_rigid_bodies.joint.schema.json`,
+`glTF.KHR_physics_rigid_bodies.joint.limit.schema.json`,
+`glTF.KHR_physics_rigid_bodies.joint.drive.schema.json`, and
+`node.KHR_physics_rigid_bodies.joint.schema.json` -- were already vendored
+as part of the original V1 `schema/*.json` wildcard fetch above (verified
+against the pinned commit's actual file listing via the GitHub API tree
+endpoint: no files are missing, nothing needed re-fetching). V9-prep is the
+first milestone to actually *read/write* them (`gltfworld.ext.khr_physics`'s
+`hinge_joint_limits`/`slider_joint_limits`/`build_joint_dict`/
+`node_joint_property`, plus the root `physicsJoints[]` array and per-node
+`joint` property in `KhrPhysicsDocument`) -- same pinned commit
+(`9dc61cb3474ff9a51f58d3592f79d5c9e572056a`), no version skew between the
+schemas used for validation and the ones used for the rest of this
+extension's subset.
+
 These files are not modified from upstream. Do not hand-edit them; re-fetch
 from the pinned commit if they ever need to change.
 
