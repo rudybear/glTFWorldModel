@@ -367,12 +367,17 @@ rejected as unreliable for the same substep reason as `dt` above).
 Every real impedance mismatch hit converting HDF5 -> glTF, in the order a
 reader would hit them. This is the primary gap-report evidence this
 milestone produces (DESIGN.md's V9 scope draws on this section directly).
-Verified against 3 real converted Collide trials (see
-`tests/test_physion_convert.py`): validator **0 errors**, real mesh
-POSITION/NORMAL/indices accessors round-trip bit-exact, pose-animation frame
-count equals the source HDF5's frame count exactly, and poses/velocities/
-physics metadata round-trip through the *existing*, unmodified
-`gltfworld.scene.convert.episode_from_gltf` to <=1e-5 absolute.
+Verified against 7 real converted Collide trials (6 deterministically spread
+across the sorted 150-trial corpus plus 1 pinned previously-failing trial,
+see `tests/test_physion_convert.py`'s `sampled_trials` fixture -- widened in
+V8.1 from V8's original `files[:3]`, see below): validator **0 errors**,
+real mesh POSITION/NORMAL/indices accessors round-trip bit-exact,
+pose-animation frame count equals the source HDF5's frame count exactly,
+and poses/velocities/physics metadata round-trip through the *existing*,
+unmodified `gltfworld.scene.convert.episode_from_gltf` to <=1e-5 absolute.
+As of V8.1, this has also been verified against the full 150-trial corpus,
+individually validated (not sampled): **150/150, 0 errors, 0 warnings** --
+see `docs/VERIFICATION.md`'s V8 section, "Observed (V8.1 re-run)".
 
 1. **No normals at all.** HDF5 carries only `mesh/vertices_i`/`faces_i` --
    raw positions and triangle indices, no per-vertex or per-face normal
@@ -384,7 +389,12 @@ physics metadata round-trip through the *existing*, unmodified
    data alone. Every converted mesh's normals are therefore *faceted*
    relative to the original renders (visible on any smoothly-curved asset,
    e.g. the `sphere`/`torus`/`cone` primitives seen in Collide), not a
-   faithful reproduction.
+   faithful reproduction. **V8.1 addendum**: the area-weighted sum can also
+   cancel to *exactly* zero for a vertex shared by opposing, equal-area
+   faces -- an unhandled case in V8 that produced zero-length (invalid)
+   NORMAL entries on 12/150 real Collide GLBs (`ACCESSOR_VECTOR3_NON_UNIT`).
+   Fixed with a documented fallback (first adjacent face normal, then
+   `+Y`) -- see `docs/VERIFICATION.md`'s V8 section.
 
 2. **Mesh pivot vs. geometric center.** TDW's own primitives are
    base-pivoted: local vertex Y ranges `[0, height]`, not `[-height/2,

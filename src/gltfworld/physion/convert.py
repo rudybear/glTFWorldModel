@@ -135,6 +135,10 @@ def _decode_str(value) -> str:
     return str(value)
 
 
+_NORMAL_DEGENERATE_EPS = 1e-9
+_NORMAL_FALLBACK_UP = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+
 def compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     """Area-weighted per-vertex normals from triangle face data.
 
@@ -144,6 +148,19 @@ def compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarra
     (via the un-normalized cross product's magnitude) rather than uniformly
     averaged, since Physion meshes (unlike gltfworld's own generated
     primitives) have widely varying face sizes.
+
+    **Zero-length fallback** (V8.1 fix, see docs/VERIFICATION.md's V8.1
+    section): a vertex's area-weighted face-normal sum can cancel to
+    *exactly* zero when its adjacent faces are (near-)coplanar-opposite --
+    e.g. a vertex shared by two faces of equal area whose normals point in
+    exactly opposite directions. Left unhandled this produces a zero-vector
+    NORMAL accessor entry, which glTF-Validator correctly flags as
+    ``ACCESSOR_VECTOR3_NON_UNIT`` (every NORMAL accessor entry must be unit
+    length, per the spec). When the accumulated normal's magnitude is below
+    ``_NORMAL_DEGENERATE_EPS``, this falls back to the (normalized) normal
+    of that vertex's first adjacent face (in face-array order); if *that*
+    face is itself degenerate (zero area), falls back to a fixed +Y up
+    vector -- always a well-defined unit vector, never zero.
     """
     v0 = vertices[faces[:, 0]]
     v1 = vertices[faces[:, 1]]
@@ -154,9 +171,37 @@ def compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarra
     for i in range(3):
         np.add.at(vertex_normals, faces[:, i], face_normals)
 
-    norms = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return (vertex_normals / norms).astype(np.float32)
+    norms = np.linalg.norm(vertex_normals, axis=1)
+    degenerate = norms < _NORMAL_DEGENERATE_EPS
+
+    safe_norms = norms.copy()
+    safe_norms[degenerate] = 1.0
+    unit_normals = vertex_normals / safe_norms[:, None]
+
+    if np.any(degenerate):
+        # First adjacent face (by ascending face index) for every vertex,
+        # vectorized via np.minimum.at over each of the 3 corner columns.
+        num_vertices = vertices.shape[0]
+        num_faces = faces.shape[0]
+        face_order = np.arange(num_faces)
+        first_face_idx = np.full(num_vertices, num_faces, dtype=np.int64)
+        for corner in range(3):
+            np.minimum.at(first_face_idx, faces[:, corner], face_order)
+
+        degenerate_ids = np.nonzero(degenerate)[0]
+        fallback_face_idx = first_face_idx[degenerate_ids]
+        fallback = np.tile(_NORMAL_FALLBACK_UP, (degenerate_ids.shape[0], 1))
+
+        has_face = fallback_face_idx < num_faces
+        candidate_normals = np.zeros_like(fallback)
+        candidate_normals[has_face] = face_normals[fallback_face_idx[has_face]]
+        candidate_norms = np.linalg.norm(candidate_normals, axis=1)
+        usable = has_face & (candidate_norms >= _NORMAL_DEGENERATE_EPS)
+        fallback[usable] = candidate_normals[usable] / candidate_norms[usable, None]
+
+        unit_normals[degenerate_ids] = fallback
+
+    return unit_normals.astype(np.float32)
 
 
 def classify_bounding_shape(vertices: np.ndarray) -> tuple[str, np.ndarray, np.ndarray]:

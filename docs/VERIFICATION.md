@@ -1315,15 +1315,24 @@ this section verifies against.
   poses/velocities, physics/semantics metadata -- per DESIGN.md's "object
   states -> our glTF conversion experiment" line.
 - **Command**: `uv run pytest tests/test_physion_convert.py -v`
-- **Expected result / observed**: **8/8 pass** on 3 real converted Collide
-  trials: glTF-Validator **0 errors** (warnings, if any, are only
-  `UNSUPPORTED_EXTENSION` for the draft/custom extensions, same bar as V1's
-  own validator test); real mesh POSITION/NORMAL/indices accessors
-  round-trip bit-exact; pose-animation frame count equals the source
-  HDF5's frame count exactly (152 == 152 on the sampled trials); poses/
-  velocities/physics metadata (mass/friction/restitution/is_static/
-  category/role) round-trip through the *existing*, unmodified
-  `gltfworld.scene.convert.episode_from_gltf` to `<=1e-5` absolute.
+- **Expected result / observed (V8.1, superseding V8's original 3-trial
+  claim below)**: **10/10 pass** on 7 real converted Collide trials (6
+  deterministically spread across the sorted 150-trial corpus -- indices
+  `[0, 29, 59, 89, 119, 149]` -- plus 1 pinned previously-failing trial,
+  `pilot_it2_collision_simple_tdw_2_dis_2_occ_0002`; see the `sampled_trials`
+  fixture and `_SAMPLE_INDICES`/`_PINNED_FAILING_TRIAL` in
+  `tests/test_physion_convert.py`): glTF-Validator **0 errors** (warnings,
+  if any, are only `UNSUPPORTED_EXTENSION` for the draft/custom extensions,
+  same bar as V1's own validator test); real mesh POSITION/NORMAL/indices
+  accessors round-trip bit-exact; pose-animation frame count equals the
+  source HDF5's frame count exactly; poses/velocities/physics metadata
+  (mass/friction/restitution/is_static/category/role) round-trip through
+  the *existing*, unmodified `gltfworld.scene.convert.episode_from_gltf`
+  to `<=1e-5` absolute.
+  - **V8's original claim here was `files[:3]`** -- the first 3 trials in
+    sorted order, never including any of the 12 trials (below) that
+    actually hit the zero-length-normal defect. An independent verifier
+    caught this; the sampling above is the fix.
 - **Full-archive robustness**: all 150 Collide test trials convert without
   error (`gltfworld.physion.ocp_eval.convert_all_trials`), including two
   edge cases only found at full scale (not in the initial 3-trial sample):
@@ -1331,7 +1340,93 @@ this section verifies against.
   13 real-world asset model names with empty exported mesh geometry --
   both handled with documented, tested fallbacks (see
   `docs/PHYSION.md` findings 12-13), never affecting the OCP-relevant
-  (agent/patient) geometry in any of the 150 trials checked.
+  (agent/patient) geometry in any of the 150 trials checked. **Converting
+  without a Python exception is not the same claim as validating clean** --
+  see the "Observed (V8.1 re-run)" block below for the honest full-150
+  validator sweep this distinction was originally missing.
+
+### Observed (V8.1 re-run) -- zero-length normal fix + full-150 validator sweep
+
+**What V8 got wrong**: `compute_vertex_normals` (`src/gltfworld/physion/convert.py`)
+summed area-weighted face normals per vertex with no fallback for the case
+where that sum cancels to *exactly* zero (a vertex shared by faces whose
+normals point in exactly opposite directions, equal magnitude -- geometrically
+real, not a corrupt-data case). Dividing by a zero norm produced a zero-length
+NORMAL accessor entry, which glTF-Validator correctly flags as
+`ACCESSOR_VECTOR3_NON_UNIT` (severity 0, a real error, not a warning). Because
+the original stage-2 test only ever converted `files[:3]`, this never showed
+up in-repo -- it was found by an independent verifier running the validator
+against all 150 converted GLBs.
+
+**The 12 trials that failed pre-fix** (glTF-Validator `numErrors` > 0, all
+`ACCESSOR_VECTOR3_NON_UNIT`, 69 errors total across the 12 files):
+
+```
+pilot_it2_collision_assorted_targets_tdw_1_dis_1_occ_0003  (4 errors)
+pilot_it2_collision_assorted_targets_tdw_1_dis_1_occ_0007  (4 errors)
+pilot_it2_collision_assorted_targets_tdw_2_dis_2_occ_0007  (4 errors)
+pilot_it2_collision_assorted_targets_tdw_2_dis_2_occ_0008  (7 errors)
+pilot_it2_collision_non-sphere_box_1_dis_1_occ_0001        (7 errors)
+pilot_it2_collision_simple_box_2_dis_2_occ_0008            (8 errors)
+pilot_it2_collision_simple_tdw_2_dis_2_occ_0000            (5 errors)
+pilot_it2_collision_simple_tdw_2_dis_2_occ_0002            (8 errors)  <- pinned in the test above
+pilot_it2_collision_tiny_ball_tdw_1_dis_1_occ_0008         (7 errors)
+pilot_it2_collision_tiny_ball_tdw_2_dis_2_occ_0005         (4 errors)
+pilot_it2_collision_tiny_ball_tdw_2_dis_2_occ_0006         (7 errors)
+pilot_it2_collision_yeet_box_1_dis_1_occ_0004              (4 errors)
+```
+
+**Fix**: when a vertex's accumulated normal magnitude is below `1e-9`,
+`compute_vertex_normals` now falls back to the (normalized) normal of that
+vertex's first adjacent face (by face-array order); if that face is itself
+degenerate (zero area), falls back to a fixed `+Y`. Two new unit tests
+(`test_compute_vertex_normals_cancellation_falls_back_to_first_face`,
+`test_compute_vertex_normals_fully_degenerate_falls_back_to_up`) construct
+synthetic meshes that trigger both fallback paths and assert unit-length
+output.
+
+**Full re-sweep, for real**: all 150 Collide HDF5 trials were reconverted
+from scratch (`data/external/physion/glb/Collide/` deleted and regenerated
+via `convert_all_trials`) with the fix in place, then every one of the 150
+resulting GLBs was run through the pinned glTF-Validator individually
+(not sampled):
+
+```
+files=150  numErrors=0 (total, across all 150)  numWarnings=0 (total)
+0/150 failing (was 12/150 pre-fix)
+```
+
+**150/150, 0 errors, 0 warnings** -- this is the first time "validator-clean
+at full-150-trial scale" is an actually-observed result rather than an
+inference from a 3-trial sample plus a separate "doesn't raise an exception"
+check.
+
+**OCP re-run, end-to-end, post-regeneration** (confirms the accuracy numbers
+in `docs/RESULTS.md`'s V8 section are unchanged by the regeneration, as
+expected -- vertex normals are a purely visual/rendering attribute and do
+not feed the state-based OCP pipeline at all; verified rather than assumed):
+
+```
+uv run python -m gltfworld.physion.ocp_eval \
+    --hdf5-dir data/external/physion/hdf5/extracted/Collide/hdf5s \
+    --glb-dir data/external/physion/glb/Collide \
+    --dynamics-ckpt runs/dynamics-v1/best.safetensors \
+    --out runs/physion-ocp-v1
+```
+
+GT-contact oracle: 94.0% calibration (n=50), **92.0%** held-out (n=100, CI
+[0.850, 0.959]), 92.67% full-150. Our dynamics (zero-shot
+`InteractionTransformer`): **49.0%** held-out (n=100, CI [0.394, 0.587]),
+52.67% full-150. Ballistic control: identical binary accuracy to our
+dynamics at both splits, median final-frame divergence 2.317m (ours) vs.
+102.536m (ballistic). Core-labels.csv sanity check: 150/150 agreement.
+Every number is bit-for-bit unchanged from V8's original run (see
+`docs/RESULTS.md`'s V8 section) -- confirming the regeneration only touched
+NORMAL accessors, never poses/velocities/physics/labels.
+
+**Fast lane**: `uv run pytest -v -m "not gpu"` -- **277 passed, 15
+deselected** (up from V8's 275/15: two new
+`compute_vertex_normals` fallback unit tests).
 
 ### Checkpoint: OCP evaluation (stage 3)
 
@@ -1364,24 +1459,52 @@ this section verifies against.
 
 - **Purpose**: confirm this milestone didn't regress anything upstream.
 - **Command**: `uv run pytest -v -m "not gpu"`
-- **Expected result / observed**: **275 passed, 15 deselected** (not-gpu;
+- **Expected result / observed (V8)**: **275 passed, 15 deselected** (not-gpu;
   up from V7's 248/15 -- `tests/test_physion_convert.py` (8 tests) and
   `tests/test_physion_ocp_eval.py` (11 tests) are new; `tests/
   test_physion_ingest.py` (8 tests, from the pre-V8 `v8-physion-ingest`
   merge) already counted toward V7's baseline via the merge).
+- **Observed (V8.1 re-run)**: **277 passed, 15 deselected** -- two new
+  `tests/test_physion_convert.py` unit tests for the zero-length-normal
+  fallback (see the "Observed (V8.1 re-run)" block above).
 
 ### Acceptance
 
 Per this milestone's own rules ("a failed transfer with a working
 transport-conversion is still a successful gap experiment -- frame it that
 way"): the transport-conversion half (stage 2) is unambiguously successful
-(validator-clean, bit-exact round trips, verified at both 3-trial and
-full-150-trial scale). The dynamics-model half (stage 3) shows a genuine,
+-- **as of the V8.1 re-run above**. **V8's original claim here was wrong**:
+it asserted the transport-conversion was "validator-clean... verified at
+both 3-trial and full-150-trial scale," but the full-150 half of that claim
+was never actually checked against the validator -- only that all 150
+trials converted without a Python exception, a materially weaker claim that
+got conflated with "validator-clean." An independent verifier caught this
+and found 12/150 real GLBs failing with `ACCESSOR_VECTOR3_NON_UNIT`
+(zero-length NORMAL vectors from an unhandled cancellation case in
+`compute_vertex_normals`). The defect is now fixed (V8.1: a documented
+fallback -- first adjacent face normal, then `+Y`), the test sampling that
+missed it is widened (`files[:3]` -- 3 trials, all from one end of the
+corpus -- to 6 deterministically spread trials plus the pinned
+`pilot_it2_collision_simple_tdw_2_dis_2_occ_0002` failing case), and the
+full 150-trial GLB corpus has now genuinely been regenerated and swept:
+**150/150, 0 errors, 0 warnings** (see "Observed (V8.1 re-run)" above) --
+*that* is the claim "validator-clean... at full-150-trial scale" may now
+honestly make. The dynamics-model half (stage 3) shows a genuine,
 honestly-reported zero-shot transfer collapse to chance -- exactly the
 outcome DESIGN.md/`docs/PHYSION.md`'s own honest feasibility notes
-anticipated ahead of time, not a surprise discovered after the fact. Both
-outcomes are reported plainly in `docs/RESULTS.md`'s V8 section, including
-the explicit, load-bearing caveat that this milestone's numbers are not a
-head-to-head comparison against the published benchmark table (one
-scenario, state-based input, a zero-shot-transferred model vs. every
-published number's trained/fine-tuned one).
+anticipated ahead of time, not a surprise discovered after the fact; its
+numbers are confirmed bit-for-bit unchanged by the V8.1 regeneration (real
+mesh normals don't feed the state-based OCP pipeline). Both outcomes are
+reported plainly in `docs/RESULTS.md`'s V8 section, including the explicit,
+load-bearing caveat that this milestone's numbers are not a head-to-head
+comparison against the published benchmark table (one scenario, state-based
+input, a zero-shot-transferred model vs. every published number's
+trained/fine-tuned one).
+
+**Commit-count correction (V8.1)**: V8 spans **6** unpushed commits, not
+5 ("merge + 4 stages", if the final `V8:` commit is loosely counted as a
+fourth "stage" alongside the three `V8 stage N` commits) -- the correct
+accounting is `acbd2f1` (V8-prep: ingest + format reconnaissance),
+`dda5673` (the `v8-physion-ingest` merge), `05dc6df`/`f28e76c`/`e00f559`
+(the three numbered V8 stage commits), and `baa02a1` (the final V8
+commit). This V8.1 fix commit is a 7th.
