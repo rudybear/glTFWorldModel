@@ -4,7 +4,10 @@
 codec); ``render`` and ``crosscheck`` are real as of milestone V2 (the
 headless renderer); ``generate`` is real as of milestone V3 (MuJoCo
 data generation); ``stats`` is real as of the dataset/provenance/stats
-milestone (V4 per the pre-training-gate scheme).
+milestone (V4 per the pre-training-gate scheme); ``generate-articulated``/
+``pack-articulated`` are real as of milestone V9 (the articulation stage --
+``wm-articulated-v1`` door/drawer scenes, see
+``gltfworld.datagen.generate_articulated``/``gltfworld.data.pack_articulated``).
 """
 
 from __future__ import annotations
@@ -182,6 +185,16 @@ def _cmd_generate(out: str, episodes: int, seed: int, steps: int, hz: float, ren
     return 0
 
 
+def _cmd_generate_articulated(out: str, episodes: int, seed: int, steps: int, hz: float, render: bool, size: int) -> int:
+    # Imported lazily: the `sim` extra (mujoco) isn't required just to run
+    # validate/inspect/render/crosscheck.
+    from gltfworld.datagen.generate_articulated import generate_articulated_dataset
+
+    result = generate_articulated_dataset(out, episodes, seed, steps=steps, hz=hz, render=render, size=size)
+    print(f"gltfworld generate-articulated: wrote {len(result.episode_paths)} episode(s) + manifest to {result.out_dir}")
+    return 0
+
+
 def _cmd_pack(episodes_dir: str, out_file: str, n_max: int) -> int:
     from gltfworld.data.pack import pack_dataset
 
@@ -191,6 +204,15 @@ def _cmd_pack(episodes_dir: str, out_file: str, n_max: int) -> int:
         f"T={result.t}, N_max={result.n_max}) + {result.meta_path}"
     )
     print(f"split sizes: {result.split_counts}")
+    return 0
+
+
+def _cmd_pack_articulated(episodes_dir: str, out_file: str) -> int:
+    from gltfworld.data.pack_articulated import pack_articulated_dataset
+
+    result = pack_articulated_dataset(episodes_dir, out_file)
+    print(f"gltfworld pack-articulated: wrote {result.out_file} ({result.count} episodes, T={result.t}) + {result.meta_path}")
+    print(f"split sizes: {result.split_counts}, joint type counts: {result.joint_type_counts}")
     return 0
 
 
@@ -244,10 +266,32 @@ def main(argv: list[str] | None = None) -> int:
         "--size", type=int, default=256, help="square render size in pixels when --render is passed (default 256)"
     )
 
+    generate_articulated_parser = subparsers.add_parser(
+        "generate-articulated",
+        help="sample wm-articulated-v1 door/drawer scenes, simulate scripted pushes in MuJoCo, write GLB episodes + manifest",
+    )
+    generate_articulated_parser.add_argument("--out", required=True, help="output directory")
+    generate_articulated_parser.add_argument("--episodes", type=int, required=True, help="number of episodes to generate")
+    generate_articulated_parser.add_argument("--seed", type=int, required=True, help="base seed (episode i uses seed + i)")
+    generate_articulated_parser.add_argument("--steps", type=int, default=100, help="recorded frames per episode (default 100)")
+    generate_articulated_parser.add_argument("--hz", type=float, default=30.0, help="recording rate in Hz (default 30)")
+    generate_articulated_parser.add_argument(
+        "--render", action="store_true", help="also render each episode's frames (needs the render extra + GPU)"
+    )
+    generate_articulated_parser.add_argument(
+        "--size", type=int, default=256, help="square render size in pixels when --render is passed (default 256)"
+    )
+
     pack_parser = subparsers.add_parser("pack", help="pack a directory of ep_*.glb episodes into one safetensors file")
     pack_parser.add_argument("episodes_dir", help="directory of ep_*.glb episodes (+ manifest.json)")
     pack_parser.add_argument("--out", required=True, dest="out_file", help="output .safetensors path")
     pack_parser.add_argument("--n-max", type=int, default=5, help="pad object dimension to this many dynamic objects (default 5)")
+
+    pack_articulated_parser = subparsers.add_parser(
+        "pack-articulated", help="pack a directory of articulated ep_*.glb episodes into one safetensors file"
+    )
+    pack_articulated_parser.add_argument("episodes_dir", help="directory of ep_*.glb articulated episodes (+ manifest.json)")
+    pack_articulated_parser.add_argument("--out", required=True, dest="out_file", help="output .safetensors path")
 
     stats_parser = subparsers.add_parser("stats", help="report dataset statistics for a packed dataset")
     stats_parser.add_argument("pack_file", help="path to a packed .safetensors file (see `gltfworld pack`)")
@@ -271,8 +315,14 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_generate(
             parsed.out, parsed.episodes, parsed.seed, parsed.steps, parsed.hz, parsed.render, parsed.size
         )
+    if parsed.command == "generate-articulated":
+        return _cmd_generate_articulated(
+            parsed.out, parsed.episodes, parsed.seed, parsed.steps, parsed.hz, parsed.render, parsed.size
+        )
     if parsed.command == "pack":
         return _cmd_pack(parsed.episodes_dir, parsed.out_file, parsed.n_max)
+    if parsed.command == "pack-articulated":
+        return _cmd_pack_articulated(parsed.episodes_dir, parsed.out_file)
     if parsed.command == "stats":
         return _cmd_stats(parsed.pack_file, parsed.as_json)
 

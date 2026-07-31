@@ -4,14 +4,17 @@ This directory is gitignored (`.gitignore`: `/data/*` + `!/data/README.md`)
 -- generated datasets live here locally but are never committed. This file
 *is* committed so the datasets are always reproducible from source.
 
-Both datasets below were generated from commit `27dea4be734e2bafcee8d1e0cff4a09f82acdfef`
-("V3.1: cylinder Y-axis convention fix (KHR interop) + doc corrections"),
-the last commit before this milestone's own changes (`git describe --always
---dirty` recorded `27dea4b-dirty` at generation time -- the dataset/pack/
-stats/metrics code added by this milestone does not change episode
-generation itself, only what's done with episodes afterwards, so
-regenerating against this milestone's own final commit reproduces bit
--identical episodes).
+`dynamics-v1`/`perception-v1` below (the `wm-scenes-v1` flat-object
+distribution, V4) were generated from commit
+`27dea4be734e2bafcee8d1e0cff4a09f82acdfef` ("V3.1: cylinder Y-axis
+convention fix (KHR interop) + doc corrections"), the last commit before
+that milestone's own changes (`git describe --always --dirty` recorded
+`27dea4b-dirty` at generation time -- the dataset/pack/stats/metrics code
+added by that milestone does not change episode generation itself, only
+what's done with episodes afterwards, so regenerating against that
+milestone's own final commit reproduces bit-identical episodes).
+`articulated-v1` (the `wm-articulated-v1` door/drawer distribution, V9) has
+its own generation commit recorded in its own section below.
 
 ## `dynamics-v1` -- 10,000 episodes, states only, no rendered frames
 
@@ -59,7 +62,40 @@ uv run gltfworld pack data/perception-v1/episodes --out data/perception-v1/packe
 - Source manifest sha256:
   `d2bc671d8a5bbb0f48cd82107e6728c8f494cc56535f51be1d872839204af5a0`
 
-## Both datasets
+## `articulated-v1` -- 1,500 episodes (750 door / 750 drawer), WITH rendered frames (V9)
+
+```bash
+uv run gltfworld generate-articulated \
+  --out data/articulated-v1/episodes \
+  --episodes 1500 --seed 20260730 --steps 100 --hz 30 \
+  --render --size 256
+uv run gltfworld pack-articulated data/articulated-v1/episodes --out data/articulated-v1/packed/articulated-v1.safetensors
+```
+
+Generated from commit `54e818e-dirty` (the V9-prep merge commit this
+milestone's own changes are built on top of; `git describe --always
+--dirty` recorded at generation time).
+
+- Wall time: 318.1s (5.30 min) to generate + render 150,000 frames (1,500
+  episodes x 100 steps); 16.1s to pack (the packed tensors here are just
+  each episode's own `ArticulatedSpec`/`joint_pos`/camera -- see
+  `gltfworld.data.pack_articulated.pack_articulated_dataset`'s docstring --
+  not a general per-object tensor contract, so packing is much cheaper than
+  `dynamics-v1`/`perception-v1`'s).
+- Disk: ~65G (rendered rgb+seg+depth frame stacks dominate, same pattern as
+  `perception-v1`).
+- Split (same `sha256`-bucketing scheme as `gltfworld.data.pack
+  .split_id_for_seed`, keyed by each episode's own seed): train 1,384 /
+  val 64 / test 52.
+- Joint type: exactly 750 revolute (door) / 750 prismatic (drawer) --
+  `generate_articulated_dataset` alternates `kind` by episode index for an
+  exact 50/50 mix, not a statistically-close-to-50/50 random draw.
+- Axis distribution: X 527 / Y 474 / Z 499 (close to the sampler's uniform
+  `{0,1,2}` draw, as expected).
+- Source manifest sha256:
+  `92b8c8cdeb22c1b2f68f9d9c7a67c1a7f53e044cce4a5054bc81e863bdb726aa`
+
+## `dynamics-v1`/`perception-v1` (`wm-scenes-v1`)
 
 - `--steps 100 --hz 30` (~3.3s/episode) is long enough that a real (small)
   fraction of episodes have an object roll/bounce off `wm-scenes-v1`'s
@@ -70,10 +106,13 @@ uv run gltfworld pack data/perception-v1/episodes --out data/perception-v1/packe
   (measured: ~14.0% of `dynamics-v1` episodes, ~12.6% of `perception-v1`
   episodes have >=1 object leave the plate at some point -- see
   `docs/PRETRAINING_GATE.md` for the full numbers).
-- Regenerating with the commands above from the same commit and the same
-  `--seed` reproduces bit-identical `.glb` episodes (`wm-scenes-v1`'s
-  sampler and MuJoCo simulation are both fully deterministic given a seed,
-  see DESIGN.md); packing is a pure function of the episodes plus
-  `gltfworld.scene.contract`/`gltfworld.data.pack`'s fixed padding/split
-  logic, so the packed `.safetensors` files (and the hashes/stats above)
-  reproduce identically too.
+
+## All three datasets
+
+Regenerating any of the commands above from the same commit and the same
+`--seed` reproduces bit-identical `.glb` episodes (both `wm-scenes-v1`'s and
+`wm-articulated-v1`'s samplers, and the MuJoCo simulation underneath both,
+are fully deterministic given a seed, see DESIGN.md); packing is a pure
+function of the episodes plus the relevant pack module's fixed padding/
+split logic, so the packed `.safetensors` files (and the hashes/stats
+above) reproduce identically too.

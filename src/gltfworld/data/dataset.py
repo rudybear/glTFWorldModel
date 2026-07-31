@@ -7,7 +7,10 @@ additionally needs the *rendered* frame stacks (``rgb.npy``/``seg.npy``/
 episode's GLB (``ep_{i:06d}/rgb.npy`` etc, see
 ``gltfworld.datagen.generate.generate_dataset``); it reads them
 memory-mapped (``np.load(..., mmap_mode="r")``) rather than loading every
-episode's frames into RAM up front.
+episode's frames into RAM up front. ``ArticulationDataset`` (V9) is the same
+"one item per rendered frame, memory-mapped rgb" pattern applied to
+``gltfworld.data.pack_articulated``'s simpler single-joint-per-episode
+packed tensors.
 """
 
 from __future__ import annotations
@@ -139,3 +142,77 @@ class PerceptionDataset(Dataset):
         mask = self.mask[episode_idx]
         class_ids = self.class_ids[episode_idx]
         return rgb, state, mask, class_ids
+
+
+class ArticulationDataset(Dataset):
+    """V9 articulation-state training data: one item per rendered frame of a
+    ``wm-articulated-v1`` episode (see ``gltfworld.data.pack_articulated``).
+
+    Mirrors ``PerceptionDataset``'s "one item per rendered frame,
+    memory-mapped rgb" pattern, but the packed tensors are the simpler
+    single-joint-per-episode set ``pack_articulated_dataset`` writes (no
+    ``N_max`` object padding -- there is exactly one joint per episode).
+
+    ``episodes_dir`` must be the same directory ``pack_articulated_dataset``
+    packed (episode order is re-derived by the same
+    ``sorted(glob("ep_*.glb"))``, so packed-tensor rows line up with
+    ``ep_{i:06d}/`` render directories by position). Only episodes that
+    actually have a rendered ``ep_{i:06d}/rgb.npy`` are included.
+
+    Returns ``(rgb, joint_pos_norm, joint_type_id, axis, limit_min, limit_max)``:
+
+    - ``rgb``: ``(H, W, 3)`` float32 in ``[0, 1]``
+    - ``joint_pos_norm``: scalar float32, ``(joint_pos - limit_min) /
+      (limit_max - limit_min)`` -- the regression target (see
+      ``gltfworld.models.articulation`` for why normalized-by-range rather
+      than raw radians/meters)
+    - ``joint_type_id``: scalar int64, 0=revolute (hinge) / 1=prismatic (slider)
+    - ``axis``: ``(3,)`` float32 unit vector (one of the world X/Y/Z basis vectors)
+    - ``limit_min``/``limit_max``: scalars float32, raw units (radians or
+      meters) -- kept alongside the normalized target so eval can denormalize
+      predictions back into real, reportable units without re-reading the GLB
+    """
+
+    def __init__(self, episodes_dir: str | Path, pack_file: str | Path, split: str | None = None) -> None:
+        self.episodes_dir = Path(episodes_dir)
+        episode_paths = sorted(self.episodes_dir.glob("ep_*.glb"))
+
+        tensors = _load_packed(pack_file)
+        split_indices = set(_split_indices(tensors["split_id"], split).tolist())
+
+        self.joint_pos = tensors["joint_pos"]
+        self.joint_type_id = tensors["joint_type_id"]
+        self.axis = tensors["axis"]
+        self.limit_min = tensors["limit_min"]
+        self.limit_max = tensors["limit_max"]
+
+        self._rgb_mmaps: dict[int, np.ndarray] = {}
+        self._index: list[tuple[int, int]] = []  # (episode_idx, frame_idx)
+
+        for episode_idx, glb_path in enumerate(episode_paths):
+            if episode_idx not in split_indices:
+                continue
+            rgb_path = glb_path.parent / glb_path.stem / "rgb.npy"
+            if not rgb_path.exists():
+                continue
+            rgb = np.load(rgb_path, mmap_mode="r")
+            self._rgb_mmaps[episode_idx] = rgb
+            for frame_idx in range(rgb.shape[0]):
+                self._index.append((episode_idx, frame_idx))
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int):
+        episode_idx, frame_idx = self._index[idx]
+        rgb_u8 = np.asarray(self._rgb_mmaps[episode_idx][frame_idx])  # copy out of the mmap
+        rgb = torch.from_numpy(rgb_u8.astype(np.float32) / 255.0)
+
+        limit_min = self.limit_min[episode_idx]
+        limit_max = self.limit_max[episode_idx]
+        joint_pos = self.joint_pos[episode_idx, frame_idx]
+        joint_pos_norm = (joint_pos - limit_min) / (limit_max - limit_min)
+
+        joint_type_id = self.joint_type_id[episode_idx]
+        axis = self.axis[episode_idx]
+        return rgb, joint_pos_norm, joint_type_id, axis, limit_min, limit_max

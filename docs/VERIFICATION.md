@@ -1639,3 +1639,185 @@ architecture/mapping writeup this section verifies against.
   `KHR_implicit_shapes` having no collider offset/center field (the actual
   reason the joint-pivot-child-node design was needed instead of moving
   object origins to the hinge point).
+
+## V9 -- articulation stage: real dataset, joint-state estimator, honest eval
+
+Builds on V9-prep's transport-only work (KHR joints, `joint_position`
+channel -- see V9-prep's section above) with a real dataset, a trained
+model, and an honest eval. See DESIGN.md's "Articulation stage (V9)"
+section for the full architecture/dataset/finding writeup this section
+verifies against. Scope reminder: joint-*state* estimation from a single
+frame (position/type/axis), not object detection, not articulated
+dynamics -- see DESIGN.md's scope note.
+
+### Checkpoint: model + loss unit tests (CPU)
+
+- **Purpose**: confirm `ArticulationEstimator`'s forward pass produces
+  correctly-shaped, finite, unit-norm axis predictions; parameter count is
+  in a sane "small model" band; `compute_articulation_losses` is correct on
+  synthetic perfect/corrupted predictions; and -- the design decision this
+  milestone documents at length -- that the axis loss is *directed*, not
+  sign-invariant (a sign-flipped axis prediction scores the worst possible
+  loss, not zero).
+- **Command**: `uv run pytest tests/test_articulation_model.py -v`
+- **Expected result**: all 7 tests pass.
+
+### Checkpoint: dataset generation + packing correctness (needs the `sim` extra)
+
+- **Purpose**: confirm `gltfworld generate-articulated` produces an exact
+  50/50 door/drawer mix (by deterministic index alternation, not a
+  statistically-close-to-50/50 random draw), deterministic per-episode
+  seeds, and loadable GLBs with exactly one articulation each; confirm
+  `gltfworld pack-articulated`'s packed tensors (`joint_pos`/`joint_type_id`/
+  `axis`/`axis_idx`/`limit_min`/`limit_max`/`camera_*`/`split_id`/`seeds`)
+  match each source episode's own `ArticulatedSpec`/`joint_pos` exactly, use
+  the same `split_id_for_seed` split scheme `gltfworld.data.pack` uses, and
+  that a mixed-`T` directory is rejected loudly rather than silently
+  truncated.
+- **Command**: `uv run pytest tests/test_generate_articulated.py tests/test_pack_articulated.py -v`
+- **Expected result**: all 7 tests pass.
+
+### Checkpoint: eval metrics/baselines/FK correctness (needs the `sim` extra, CPU -- no GPU/render)
+
+- **Purpose**: confirm `compute_metrics` computes hinge-degrees/slider-cm
+  errors correctly (including the exact unit conversion, on a known
+  corruption), never conflates the two joint types' error units, scores an
+  axis sign-flip as exactly 180 degrees, and correctly detects a type
+  misclassification; confirm both baselines (`predict-midpoint-of-range`,
+  `predict-dataset-mean-axis`) are scored *only* on the one metric each
+  targets; and -- the correctness-critical part --  confirm
+  `build_predicted_episode`'s forward-kinematics reconstruction (used by the
+  re-render check) agrees with a *real* MuJoCo-simulated episode's actual
+  recorded pose when fed that episode's own `joint_pos` back in, at several
+  points across the trajectory, for both door and drawer -- the same
+  anchor/axis composition `tests/test_articulated_physics.py`'s articulation
+  consistency check verifies, run here in the predict direction instead of
+  the verify direction.
+- **Command**: `uv run pytest tests/test_articulation_eval.py -v`
+- **Expected result**: all 10 tests pass.
+
+### Checkpoint: `articulated-v1` dataset build (real, not just unit-tested)
+
+- **Purpose**: generate the real 1,500-episode dataset this milestone
+  trains/evaluates against, and record its actual generation/packing
+  cost/stats.
+- **Command**:
+  ```bash
+  uv run gltfworld generate-articulated --out data/articulated-v1/episodes \
+    --episodes 1500 --seed 20260730 --steps 100 --hz 30 --render --size 256
+  uv run gltfworld pack-articulated data/articulated-v1/episodes \
+    --out data/articulated-v1/packed/articulated-v1.safetensors
+  ```
+- **Expected result / observed**: 1,500 episodes x 100 frames = 150,000
+  rendered frames in **318.1s (5.30 min)**, ~65GB on disk; packed in
+  **16.1s**. Split: train 1,384 / val 64 / test 52. Joint type: exactly 750
+  revolute / 750 prismatic. Axis: X 527 / Y 474 / Z 499. See `data/README.md`
+  for the exact pinned command, source-manifest hash, and full stats.
+
+### Checkpoint: training harness smoke (gpu, real `articulated-v1` data)
+
+- **Purpose**: confirm the training harness (`ArticulationDataset` loading,
+  RGB-only augmentation, optimizer/scheduler, checkpoint IO) works
+  end-to-end against real rendered frames; `--smoke` (500 steps) drops the
+  EMA train loss >= 30% inside a 5-minute budget; `--smoke-val` (~3,000
+  steps) shows val `joint_pos_norm_mae` improve both relatively (>= 15% from
+  its step-250 value) and in absolute terms (< 0.25) inside a 20-minute
+  budget -- the same "a train-loss-only check cannot tell generalization
+  from memorization" lesson `train_perception`'s V6.1/V6.2 postmortem
+  established, applied here from the start rather than discovered the hard
+  way a second time.
+- **Command**: `uv run pytest tests/test_train_articulation_smoke.py -v`
+- **Expected result**: both tests pass.
+
+### Checkpoint: full real training run (gpu, for the orchestrator)
+
+- **Purpose**: run the actual 15,000-step schedule (not just the smoke
+  checks) against `articulated-v1`, and report the honest training-curve
+  finding this run surfaced.
+- **Command**: `uv run python -m gltfworld.train.train_articulation --config configs/articulation_v1.json --out runs/articulation-v1`
+- **Observed**: 956.2s (~15.9 min) wall clock. Train loss falls monotonically
+  (0.172 -> 0.00121). Val total loss bottoms out early (0.135 at step 1500,
+  the run's actual minimum) then rises for the rest of the run (up to
+  ~1.4-1.6 by step 15000) -- driven by the `type` cross-entropy term
+  overfitting (loss_type 0.116 -> 1.39), even while `axis_err_deg` keeps
+  *improving* the whole run (4.55 deg -> ~0.3-0.4 deg) and
+  `joint_pos_norm_mae` stays roughly flat (~0.08-0.11). Net: type accuracy
+  peaks at step 1500 (0.965) and degrades by step 15000 (0.858). The
+  harness's own `best.safetensors` selection (lowest total val loss)
+  automatically lands on step 1500 as a result -- confirmed by directly
+  re-evaluating `last.safetensors` (step 15000) on the test split: it scores
+  a *better* axis error (0.216 vs 1.842 degrees) and hinge error (1.189 vs
+  3.349 degrees) but **fails** the type-accuracy acceptance bar (0.921 <
+  0.98). See DESIGN.md's "Articulation stage (V9)" section for the full
+  writeup and the honest-gap this surfaces (three sub-tasks, three optimal
+  stopping points, one shared training run).
+
+### Checkpoint: eval CLI end-to-end (gpu, metrics + baselines + re-render + glTF-at-every-hop)
+
+- **Purpose**: confirm the eval CLI runs end-to-end against real rendered
+  test frames and a real checkpoint (metrics/baseline pipeline with
+  `--render-samples 0`, and separately the GPU re-render check with a shared
+  renderer, mirroring `tests/test_perception_eval_gpu.py`'s renderer-reuse
+  pattern), and report the real trained-checkpoint eval numbers.
+- **Command**: `uv run pytest tests/test_articulation_eval_gpu.py -v`, then
+  for the real numbers:
+  ```bash
+  uv run python -m gltfworld.eval.articulation_eval \
+    --ckpt runs/articulation-v1/best.safetensors \
+    --data data/articulated-v1 --split test \
+    --out runs/articulation-v1/eval --render-samples 50
+  ```
+- **Expected result / observed**: both pytest cases pass. Real eval (test
+  split, 52 episodes / 5,200 frames, `best.safetensors` @ step 1500):
+
+  | model | hinge err deg (median) | slider err cm (median) | type acc | axis err deg (median) |
+  | --- | --- | --- | --- | --- |
+  | `ArticulationEstimator` | 3.349 | 1.449 | 0.9823 | 1.842 |
+  | predict-midpoint-of-range | 34.809 | 7.924 | n/a | n/a |
+  | predict-dataset-mean-axis | n/a | n/a | n/a | 54.820 |
+
+  Re-render check (50 sampled test frames): PSNR median **39.31 dB**, SSIM
+  median **0.9983**, round-trip error **0.0**, glTF-Validator **0 errors**
+  across all 50 predicted `T=1` GLBs.
+
+### Checkpoint: full test suite
+
+- **Purpose**: confirm this milestone didn't regress anything upstream and
+  that everything new is exercised.
+- **Command**: `uv run pytest -v -m "not gpu"` (fast lane) and
+  `uv run pytest -v` (full, GPU machine -- GPU was free for this milestone,
+  unlike V9-prep's CPU-only scope).
+- **Expected result / observed**: fast lane **350 passed** (24 new
+  non-gpu-marked tests over the 350 vs. the V9-prep-era 350 baseline this
+  branch started from -- `test_articulation_model.py` (7),
+  `test_generate_articulated.py` (4), `test_pack_articulated.py` (3),
+  `test_articulation_eval.py` (10)); full lane (fast lane + gpu lane, GPU
+  free) additionally exercises `test_train_articulation_smoke.py` (2) and
+  `test_articulation_eval_gpu.py` (2).
+
+### Acceptance (see DESIGN.md's "Articulation stage (V9)" section)
+
+- Hinge median joint-position error <= 5 degrees.
+- Slider median joint-position error <= 2 cm.
+- Joint-type accuracy >= 0.98.
+- Axis median angular error <= 10 degrees.
+
+**Result: all four bars clear** (`best.safetensors`, step 1500, test split):
+hinge **3.349 deg** (<= 5), slider **1.449 cm** (<= 2), type accuracy
+**0.9823** (>= 0.98, thin margin), axis **1.842 deg** (<= 10). Reported
+honestly per house policy: type accuracy clears with real but thin margin,
+and would **not** clear at all with the final-step checkpoint instead
+(0.921) -- see DESIGN.md's training-curve finding for the full honest
+account of why checkpoint selection mattered here.
+
+### Checkpoint: honest gaps documented
+
+- **Purpose**: confirm the gaps this milestone's design necessarily leaves
+  are recorded plainly rather than glossed over.
+- **Command**: see DESIGN.md's "Honest gaps (feeding the full V9 gap
+  report)" subsection (under "Articulation stage (V9)").
+- **Expected result**: five gaps recorded -- articulated dynamics being
+  out of scope, joint limits being given rather than estimated, the fixed
+  camera (no viewpoint generalization tested), single-object-per-scene (no
+  clutter/occlusion/multi-joint testing), and the three sub-tasks'
+  differing optimal stopping points within one shared training run.
