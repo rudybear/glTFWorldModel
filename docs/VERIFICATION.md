@@ -1,5 +1,19 @@
 # Verification protocol
 
+> **This is a historical, per-milestone log, not a live command reference.**
+> Each checkpoint's command/expected-result was accurate against the repo's
+> `HEAD` *at that milestone*, not necessarily against the current `main`.
+> Later milestones sometimes change behavior a re-run would now see
+> differently -- e.g. V0's checkpoint below documents the CLI's stub
+> behavior (`gltfworld validate` prints "not implemented yet" and exits 2),
+> which V1 superseded with a real `validate` subcommand (see V1's own
+> "CLI `validate`/`inspect` demo" checkpoint further down). If you re-run an
+> early checkpoint and see different behavior than documented, check whether
+> a later milestone in this same file already explains the change before
+> assuming something regressed. For a snapshot of what's actually true of
+> the *current* clone, see the "Expected results on a fresh clone" note in
+> [README.md](../README.md)'s Setup section.
+
 Every milestone in [DESIGN.md](../DESIGN.md) is verified by an agent
 independent of the one that implemented it. That agent emits a JSON verdict
 (`{"milestone": "...", "verdict": "PASS"|"FAIL", "checks": [...]}`); a FAIL

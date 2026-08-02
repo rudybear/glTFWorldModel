@@ -260,6 +260,22 @@ anticipates.
 
 ### Data acquired
 
+**Copy-pasteable download command** (the single file the rest of this repo
+-- `gltfworld.physion.ocp_eval`, `data/README.md`, README's "Physion
+external anchor" section -- expects at `data/external/physion/hdf5/`):
+
+```bash
+mkdir -p data/external/physion/hdf5/extracted
+curl -o data/external/physion/hdf5/Collide_testing_HDF5s.tar.gz \
+  https://physics-benchmarking-neurips2021-dataset.s3.amazonaws.com/Collide_testing_HDF5s.tar.gz
+tar -xzf data/external/physion/hdf5/Collide_testing_HDF5s.tar.gz \
+  -C data/external/physion/hdf5/extracted
+```
+
+~33 GB download; produces `data/external/physion/hdf5/extracted/Collide/hdf5s/`
+(150 per-trial `.hdf5` files). `data/external/` is git-ignored, so nothing
+from this download is ever committed.
+
 `Collide_testing_HDF5s.tar.gz` (the smallest rigid-scenario test tier,
 32.62 GiB per the table above -- verified again via a direct HTTP HEAD
 immediately before download: `Content-Length: 35026607691`, exact match),

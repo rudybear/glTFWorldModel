@@ -82,6 +82,12 @@ for the pre-training data-quality gate every model trained against.
 - **[docs/RWM_EXTENSIONS.md](docs/RWM_EXTENSIONS.md)** — channel-by-channel/
   field-by-field reference for the custom `RWM_state_series` extension and
   `extras.rwm` bookkeeping.
+- **[docs/EXTERNAL_VALIDITY.md](docs/EXTERNAL_VALIDITY.md)** — two
+  independent experiments testing this project's own claims from the
+  outside: a spec-only decoder reimplementation (bitwise-identical, 6
+  under-specified conventions found and fixed) and a clean-room
+  reproduction from the public clone (exact-digit smoke reproduction,
+  bit-identical seeded generation, onboarding friction found and fixed).
 
 ## Stack
 
@@ -103,6 +109,45 @@ uv sync --all-extras --dev
 uv run pytest -m "not gpu"   # CI-equivalent: no GPU/EGL required
 uv run pytest                # full suite, needs a GPU + working EGL offscreen context
 ```
+
+### Expected results on a fresh clone
+
+Verified by an independent clean-room reproduction from the public clone
+(see [docs/EXTERNAL_VALIDITY.md](docs/EXTERNAL_VALIDITY.md), Experiment B) --
+what a stranger with no local data/checkpoints actually sees:
+
+- **Fast lane** (`uv run pytest -m "not gpu" -q`, right after `uv sync
+  --all-extras --dev`, no GPU needed): **336 passed, 17 skipped
+  (Physion-data-dependent), 19 deselected** (gpu-marked).
+- **GPU lane** (`uv run pytest -q`, needs a GPU + working EGL context): **8
+  passed, 11 skipped** until datasets/checkpoints exist locally.
+
+What unlocks the full figures (**353 passed / 19 deselected** on the fast
+lane once the Physion archive is present -- 0 skipped, since all 17
+Physion-dependent skips convert to real passes; **18 passed + 1 xfail** on
+the gpu lane, i.e. every gpu-marked test, once datasets + trained
+checkpoints exist locally):
+
+1. **Physion archive** (~33 GB) -- unlocks the 17 Physion-dependent fast-lane
+   skips:
+
+   ```bash
+   mkdir -p data/external/physion/hdf5/extracted
+   curl -o data/external/physion/hdf5/Collide_testing_HDF5s.tar.gz \
+     https://physics-benchmarking-neurips2021-dataset.s3.amazonaws.com/Collide_testing_HDF5s.tar.gz
+   tar -xzf data/external/physion/hdf5/Collide_testing_HDF5s.tar.gz \
+     -C data/external/physion/hdf5/extracted
+   ```
+
+   (see [docs/PHYSION.md](docs/PHYSION.md) for the full archive-structure
+   writeup and where the `Physion.zip` "Core" tier fits in).
+
+2. **Dataset generation** -- unlocks GPU-lane tests that need real rendered
+   data (see "Reproduce everything" below for the exact `generate`/`pack`
+   commands for `dynamics-v1`/`perception-v1`/`articulated-v1`).
+3. **Training** -- unlocks GPU-lane tests that need real checkpoints (see
+   "Reproduce everything" below for the `train_dynamics`/`train_perception`/
+   `train_articulation` commands).
 
 ## Reproduce everything
 

@@ -112,6 +112,81 @@ read), but gltfworld's own `episode_from_gltf` reconstructs
 `ArticulatedSpec` directly from `extras.rwm.articulations`, not by
 re-deriving it from the KHR joint dicts.
 
+## Decoder conventions (normative)
+
+These are load-bearing for anyone decoding `RWM_state_series`/`extras.rwm`
+independently of `gltfworld.ext.rwm`/`gltfworld.scene.convert` -- surfaced by
+an isolated, spec-only reimplementation (given only this document + the
+vendored schemas + sample GLBs, no source code) that decoded bitwise-
+identically but had to *guess* every rule below; one guess (object
+inclusion, below) was initially wrong and produced silently-wrong shapes
+before being corrected against the schema/GLBs. See
+[docs/EXTERNAL_VALIDITY.md](EXTERNAL_VALIDITY.md) for the full experiment
+writeup. Each rule was already true of every gltfworld-produced GLB; this
+section makes the rules explicit instead of implicit.
+
+1. **Object-inclusion rule.** The N (object) axis is *every* node carrying
+   `extras.rwm.object_id` -- **including** `is_static` objects (e.g. the
+   ground plate). Do not filter on `is_static`; a static object still gets
+   a row in `poses`/`states` (it just never moves). The *only* nodes
+   excluded from the N axis are ones with no `extras.rwm` at all (the
+   camera node, light nodes) -- those are structurally different (no
+   `object_id`, no physics collider), not merely "static objects to skip".
+   Getting this wrong (e.g. excluding `is_static` objects, or trying to
+   detect "the ground" by convention rather than by the presence/absence
+   of `extras.rwm`) silently produces a scene with the wrong object count
+   and, worse, an `RWM_state_series` channel-to-object mapping that's off
+   by one for every object node that comes after the (wrongly) skipped one.
+2. **Array ordering: ascending `object_id`.** Whatever you decode into a
+   `(..., N, ...)` array (poses, per-node RWM channels, per-node
+   `extras.rwm`), order the N axis by **ascending `extras.rwm.object_id`**,
+   not by glTF node order. glTF does not guarantee node array order
+   reflects any semantic ordering, and nothing in this format's schema
+   promises object nodes appear in `object_id` order -- `object_id` itself
+   is the only stable, order-independent key. (gltfworld's own encoder
+   happens to emit nodes in ascending-`object_id` order today, so node
+   order and `object_id` order coincide in every GLB this project has ever
+   produced -- but a decoder that relies on that coincidence rather than
+   sorting explicitly is relying on an implementation detail, not the
+   spec.)
+3. **Quaternion component order: `(x, y, z, w)`.** `RWM_state_series` and
+   the pose animation both use core glTF's own quaternion convention
+   (`rotation` accessors, and any RWM channel carrying quaternion-shaped
+   data such as `pose_variance`'s 4 quaternion-variance components) --
+   scalar component last, not first. This isn't an RWM-specific rule (it's
+   just core glTF), but it's easy to get backwards when reading
+   `pose_variance`/`joint_position`-adjacent data in isolation from a
+   general glTF background, so it's stated here explicitly rather than
+   left implicit.
+4. **Pose animation samplers MUST use `STEP` interpolation.** Every
+   `AnimationSampler` backing an object's `translation`/`rotation` channel
+   uses `"interpolation": "STEP"`, never the glTF default (`"LINEAR"`).
+   This is deliberate, not an oversight: gltfworld's animation is a
+   faithful record of *sampled simulator states*, not a keyframed
+   authored animation meant to be smoothly interpolated between samples --
+   `LINEAR`-interpolating quaternions in particular would silently
+   fabricate intermediate orientations the simulator never produced. A
+   decoder that assumes `LINEAR` (or ignores `interpolation` and always
+   linearly blends) will read plausible-looking but physically fabricated
+   in-between frames whenever it samples off the exact recorded times.
+5. **Chunked channels concatenate in ascending `component` order.**
+   Channels whose natural feature width exceeds 4 (`pose_variance` at 7,
+   `action` when its task-defined width A > 4) are split into multiple
+   channels of the same `kind`/`target`, each tagged with a 0-based
+   `component` field (see the chunking table above). Reassemble a
+   channel's full feature vector by concatenating its chunks **in
+   ascending `component` order** -- `component` is not guaranteed to
+   appear in a channel's array position, i.e. don't assume the first
+   `pose_variance` channel you encounter in `channels[]` is `component: 0`.
+6. **Channel accessor `count` MUST equal `len(times)`.** Every channel's
+   `accessor` (as referenced by `RWM_state_series.channels[i].accessor`)
+   has `count` exactly equal to the length of the shared `timesAccessor`
+   array -- one value per recorded frame, no channel-specific subsampling
+   or padding. Decoders SHOULD validate this (`accessor.count ==
+   len(times)`) before indexing into a channel's data, rather than
+   silently truncating/overrunning if a malformed or hand-edited document
+   violates it.
+
 ## Semantics taxonomy v0 (V9-prep)
 
 The label/affordance vocabulary `node.extras.rwm.semantics` draws from,

@@ -219,7 +219,34 @@ def _cmd_pack_articulated(episodes_dir: str, out_file: str) -> int:
 def _cmd_stats(pack_file: str, as_json: bool) -> int:
     from gltfworld.data.stats import compute_stats, format_human
 
-    report = compute_stats(pack_file)
+    path = Path(pack_file)
+    if path.is_dir():
+        # A bare directory (e.g. the `--out` of `gltfworld pack`'s packed/
+        # folder, or the episodes dir by mistake) used to crash with an
+        # opaque `OSError: No such device` from safetensors' Rust loader.
+        # Resolve it to the single .safetensors file inside if there's
+        # exactly one; otherwise print a clear usage error instead.
+        candidates = sorted(path.glob("*.safetensors"))
+        if len(candidates) == 1:
+            path = candidates[0]
+        elif not candidates:
+            print(
+                f"gltfworld stats: {pack_file!r} is a directory with no .safetensors file in it.\n"
+                "Pass the path to a packed .safetensors file (see `gltfworld pack`'s --out), e.g.:\n"
+                f"  gltfworld stats {str(path).rstrip('/')}/<dataset>.safetensors",
+                file=sys.stderr,
+            )
+            return 2
+        else:
+            names = ", ".join(c.name for c in candidates)
+            print(
+                f"gltfworld stats: {pack_file!r} is a directory containing multiple .safetensors "
+                f"files ({names}) -- pass the specific file you want, e.g. {candidates[0]}.",
+                file=sys.stderr,
+            )
+            return 2
+
+    report = compute_stats(path)
     if as_json:
         print(json.dumps(report, indent=2))
     else:

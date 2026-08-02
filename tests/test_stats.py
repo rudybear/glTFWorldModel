@@ -103,3 +103,48 @@ def test_stats_cli_human_exits_zero(packed_dataset: Path):
     )
     assert result.returncode == 0
     assert "NaN/Inf count: 0" in result.stdout
+
+
+def test_stats_cli_directory_with_single_safetensors_resolves(packed_dataset: Path):
+    # Passing the *directory* containing the packed file (a natural mistake --
+    # e.g. reusing `gltfworld pack`'s --out parent) used to crash with an
+    # opaque `OSError: No such device` from safetensors' loader; a directory
+    # holding exactly one .safetensors file should just work.
+    result = subprocess.run(
+        [sys.executable, "-m", "gltfworld.cli", "stats", str(packed_dataset.parent)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "NaN/Inf count: 0" in result.stdout
+
+
+def test_stats_cli_directory_with_no_safetensors_gives_friendly_error(tmp_path: Path):
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    result = subprocess.run(
+        [sys.executable, "-m", "gltfworld.cli", "stats", str(empty_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "OSError" not in result.stderr
+    assert "No such device" not in result.stderr
+    assert "no .safetensors file" in result.stderr
+
+
+def test_stats_cli_directory_with_multiple_safetensors_gives_friendly_error(tmp_path: Path):
+    ambiguous_dir = tmp_path / "ambiguous"
+    ambiguous_dir.mkdir()
+    (ambiguous_dir / "a.safetensors").touch()
+    (ambiguous_dir / "b.safetensors").touch()
+    result = subprocess.run(
+        [sys.executable, "-m", "gltfworld.cli", "stats", str(ambiguous_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "multiple .safetensors" in result.stderr

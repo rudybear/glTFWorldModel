@@ -124,6 +124,33 @@ Explicitly *not* recommended: video-frame sequences in glTF; widening accessors 
 
 ---
 
+## External validity: we tested ourselves
+
+Our own verification protocol only proves we built what we said we built —
+so we ran two experiments designed to check the claims *from the outside*:
+
+- **Blind spec-only reimplementation.** An implementer with zero access to
+  our source — only `RWM_EXTENSIONS.md` + JSON Schemas + sample GLBs —
+  decoded a whole episode **bitwise-identically**. Getting there required
+  guessing 6 conventions our docs left implicit (object-inclusion on the
+  N axis, array ordering, quaternion order, STEP interpolation, chunked-
+  channel reassembly order, the count==len(times) invariant) — one guess
+  was initially *wrong* and produced silently-wrong shapes. All 6 are now
+  written down as normative.
+- **Clean-room reproduction from the public clone.** A fresh `git clone` +
+  documented setup reproduced our smoke-test pass/skip counts and split
+  sizes **digit-for-digit**, and seeded dataset generation **bit-identical**
+  across machines.
+
+**This is exactly what a ratification process exists to surface** —
+ambiguities an author blind to their own tacit assumptions can't see in
+their own writing. Two cheap experiments found 6 normative gaps in a spec
+we thought was complete. That's the argument for taking the
+`RWM_state_series` pattern to a real KHR track rather than shipping it as
+one repo's permanent custom extension.
+
+---
+
 ## Everything is verifiable
 
 - **Public repo**: github.com/rudybear/glTFWorldModel (MIT)
