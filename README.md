@@ -66,8 +66,9 @@ for the pre-training data-quality gate every model trained against.
   milestone, including every documented deviation from the original spec
   text and every honestly-reported "didn't meet the bar" finding.
 - **[docs/RESULTS.md](docs/RESULTS.md)** — recorded, measured results for
-  every trained model (V5-V9), reported honestly whether or not they met
-  their acceptance bar.
+  the trained models through V8.1, reported honestly whether or not they
+  met their acceptance bar (V9 articulation numbers live in
+  VERIFICATION.md's and DESIGN.md's V9 sections).
 - **[docs/VERIFICATION.md](docs/VERIFICATION.md)** — the independent
   verification protocol: purpose/command/expected-result for every
   checkpoint in every milestone, with actual observed values recorded next
