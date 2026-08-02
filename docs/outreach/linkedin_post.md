@@ -2,26 +2,24 @@
 
 ---
 
-Can glTF be the transport format for world models and robotics — the way USD is becoming for simulation?
+Could glTF — the format your 3D viewer already speaks — carry a full world-model pipeline? We put it to the test, and honestly: glTF surprised us with how far it goes. 🚀
 
-We built the experiment to find out: a complete open-source pipeline where glTF 2.0 GLB is the interchange at *every* hop — MuJoCo episodes → GLB (pose animation + draft KHR physics extensions + a custom time-series extension) → renderer → trained perception & dynamics models → inference re-emitting valid GLB, closed loop.
+We built a complete open-source pipeline with glTF 2.0 GLB as the interchange at *every* hop: MuJoCo physics episodes → GLB → renderer → trained perception & dynamics models → inference re-emitting valid GLB, closed loop. Delivered end-to-end, from empty repo to working models, in a matter of days.
 
-What we learned, the honest version:
+The best part: where core glTF didn't yet have a vocabulary for dynamic world state, its extension mechanism was flexible enough that we simply added one — an experimental `RWM_state_series` extension carrying velocities, actions, joint states and uncertainty over glTF's own accessor machinery. 10,000+ episodes later: every file validator-clean, every episode still playable in any stock glTF viewer, extensions riding along additively. The draft Khronos physics extensions (rigid bodies, collision shapes, joints) slotted right in for mass, friction, colliders — including articulated doors and drawers.
 
-✅ glTF's accessor machinery is genuinely reusable as a time-series transport — 10,000+ episodes, every file validator-clean, playable in any stock viewer
-✅ Learned dynamics over the transport: 42–176× better than ballistic at long horizons; closed visual loop 34× better
-❌ glTF cannot express *any* non-pose dynamic state (velocity, actions, joint angles, uncertainty) — we had to invent an extension
-❌ The draft KHR physics extensions are close but miss viscous damping, bounded drives, weld joints, and collider offsets
-📏 A finding for anyone doing perception-in-the-loop: detector errors are frame-correlated (autocorr 0.55–0.82) — i.i.d. noise models overestimate closed-loop degradation 17×
+Some numbers from the closed loop: learned dynamics 42–176× better than a ballistic baseline at long horizons; the full perceive→predict→re-render loop 34× better — plus a fun measured insight: real detector errors are frame-correlated, so naive i.i.d. noise models overestimate closed-loop degradation 17×.
 
-Full gap report — 20 evidence-backed findings, 5 things glTF got right, and ranked extension recommendations, every claim traceable to code and measurements:
+We documented everything — including where extensions had to fill in — as an evidence-backed gap report with ranked recommendations for the glTF ecosystem.
 
-🔗 github.com/rudybear/glTFWorldModel
+Next step: generalizing the experimental RWM extensions beyond our pipeline — toward a reusable time-series/state vocabulary for world models, robotics, and digital twins on glTF.
 
-Feedback welcome, especially from the Khronos 3D Formats and robotics simulation communities.
+🔗 github.com/rudybear/glTFWorldModel (MIT)
 
-#glTF #WorldModels #Robotics #Khronos #3D #SimulationAI #OpenSource
+Feedback very welcome — especially from the Khronos 3D Formats and robotics simulation communities.
+
+#glTF #WorldModels #Robotics #Khronos #3D #SimulationAI #OpenSource #DigitalTwin
 
 ---
 
-*(Character count ~1,600 — within LinkedIn's optimal range. Emojis optional per your taste.)*
+*(~1,900 characters. Tone: glTF-positive — flexibility and interop as the headline, gaps framed as extension opportunities with a constructive next step.)*
