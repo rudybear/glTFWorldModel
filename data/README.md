@@ -37,7 +37,9 @@ uv run gltfworld pack data/dynamics-v1/episodes --out data/dynamics-v1/packed/dy
   `source_manifest_hash_sha256`):
   `b6e8c86c4ce66e83f0e490bc44faa6889f211e7c1ab8d571985934e57a13a516`
 
-## `perception-v1` -- 500 episodes, WITH rendered frames (256x256 rgb+seg+depth)
+## `perception-v1` -- originally 500 episodes; regenerated at 4,000 (V6.1)
+
+**V4's original generation** (numbers below are this original run):
 
 ```bash
 uv run gltfworld generate \
@@ -61,6 +63,28 @@ uv run gltfworld pack data/perception-v1/episodes --out data/perception-v1/packe
 - Split: train 458 / val 27 / test 15.
 - Source manifest sha256:
   `d2bc671d8a5bbb0f48cd82107e6728c8f494cc56535f51be1d872839204af5a0`
+
+**V6.1 regenerated `perception-v1` at production scale** (4,000 episodes,
+same base seed `20260728` so the original 500 are a strict prefix), after
+the 500-episode dataset was found too small (69.9x epoch-equivalent over
+25k steps caused memorization rather than generalization -- see DESIGN.md's
+"V6.1 postmortem"):
+
+```bash
+uv run gltfworld generate \
+  --out data/perception-v1/episodes \
+  --episodes 4000 --seed 20260728 --steps 100 --hz 30 \
+  --render --size 256
+uv run gltfworld pack data/perception-v1/episodes --out data/perception-v1/packed/perception-v1.safetensors
+```
+
+This is the dataset every reported V6-V7 result (docs/RESULTS.md) actually
+trains/evaluates against -- not the original 500-episode run above, which
+is kept documented here only for provenance/reproducibility of the
+memorization postmortem itself. Exact wall-time/disk numbers for the
+4,000-episode regeneration were not separately recorded in this file at
+generation time; DESIGN.md's V6.1/V6.2 sections have the full narrative
+(epoch-equivalent guard, out-of-box GT filter) this regeneration fed into.
 
 ## `articulated-v1` -- 1,500 episodes (750 door / 750 drawer), WITH rendered frames (V9)
 

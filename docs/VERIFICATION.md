@@ -1861,3 +1861,67 @@ root cause and re-enables single-process gpu test execution.
 - **Command**: `uv run pytest -m "not gpu" -q`
 - **Expected result**: **350 passed** (the entire non-GPU test suite).
 - **Observed (2026-08-02)**: **350 passed** as expected.
+
+## V10 -- gap report, README, final documentation pass (docs-only)
+
+This milestone is a consolidation, not a new experiment: it collects every
+honest gap, finding, and honest-miss recorded across V0-V9.1 into
+[docs/GAP_REPORT.md](GAP_REPORT.md), rewrites README.md as the project's
+final summary, and does a documentation-only pass over stale
+cross-references (`data/README.md`'s `perception-v1` section still
+described the original, superseded 500-episode generation as if it were
+current -- corrected to record both the original run and the V6.1
+production-scale regeneration explicitly, rather than silently leaving the
+stale command as the only one a reader would find). No source code changed.
+
+### Checkpoint: gap report evidence audit
+
+- **Purpose**: confirm every numbered finding in `docs/GAP_REPORT.md` traces
+  to a real, pre-existing source in this repo (DESIGN.md, docs/PHYSION.md,
+  docs/RESULTS.md, docs/RWM_EXTENSIONS.md, docs/VERIFICATION.md) rather than
+  being invented for the report -- i.e. this is a *consolidation* document,
+  not a new claim-generating one.
+- **Command**: manual cross-read, this session -- every G-numbered finding
+  in `docs/GAP_REPORT.md` was checked against its cited source section
+  (DESIGN.md's "Honest gaps" subsections under V9-prep/V9, docs/PHYSION.md's
+  14 numbered conversion findings, docs/RESULTS.md's V7/V8 sections, this
+  file's own per-milestone checkpoints) before being written down.
+- **Expected result / observed**: 20 numbered gap findings (G1-G20) plus 5
+  positive findings (P1-P5), every one citing a specific file/module/test
+  and, where a number exists, the exact measured value from its source
+  document (e.g. G6's 0.55-0.82 lag-1 autocorrelation and 17x Arm B/C
+  divergence, both taken verbatim from docs/RESULTS.md's V7 section, not
+  recomputed). **No G1-G13 skeleton pre-existed anywhere in this repo's
+  history** (checked via `grep -rn "G[0-9]" DESIGN.md docs/*.md` before
+  writing -- the only prior reference is docs/RESULTS.md's own forward
+  pointer, "relevant to the gap-report's G6 on uncertainty models",
+  honored by making the uncertainty/correlated-noise finding G6 as that
+  reference anticipated).
+
+### Checkpoint: fast lane green (docs-only change)
+
+- **Purpose**: confirm a documentation-only milestone genuinely changed no
+  behavior -- the fast lane must be bit-for-bit the same pass count as
+  V9.1's own final observed value.
+- **Command**: `uv run pytest -q -m "not gpu"`
+- **Expected result**: unchanged from V9.1's **350 passed**.
+- **Observed (2026-08-02)**: **350 passed, 19 deselected** in 26.96s. Same
+  350-pass count V9.1 recorded (the `19 deselected` vs. V9.1's earlier
+  `1 xfailed` figures reflect the `-m "not gpu"` marker filter deselecting
+  every gpu-marked test outright, a different lane than V9.1's own
+  `-m gpu` full-GPU-lane run -- not a regression; V9-prep's own
+  `-m "not gpu"` figure of **350 passed** already established this exact
+  count with the same deselection semantics).
+
+### Deliverables this milestone
+
+- [docs/GAP_REPORT.md](GAP_REPORT.md) v1.0 (new).
+- [README.md](../README.md) rewritten as the project's final summary
+  (results-highlights table, documentation map, stack table, full
+  reproduce-everything command list).
+- This section.
+- [DESIGN.md](../DESIGN.md)'s closing V10 status note.
+- `data/README.md`'s `perception-v1` section corrected (see above).
+
+No new dependency, no CI workflow change, no source code under
+`src/gltfworld/` touched.

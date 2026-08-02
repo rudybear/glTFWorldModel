@@ -1,6 +1,7 @@
 # DESIGN
 
-Status: 2026-07-30, milestone V9 (articulation stage).
+Status: 2026-08-02, milestone V10 (final) -- see "V10 closing status" at
+the end of this document.
 
 ## Architecture flow
 
@@ -516,6 +517,16 @@ model milestone lined up, so dynamics moved first.
   *dynamics* (predicting how a joint's state evolves over time) and the
   full milestone-spec gap report/RWM extension write-up remain open --
   future work, see "Articulation stage (V9)"'s own scope/gaps notes.
+- **V9.1** (done) — fixed the EGL context-lifecycle bug V9 discovered
+  (`closed_loop.main()` unconditionally deleting a shared EGL display);
+  single-process `-m gpu` lane green again. See "V9.1 addendum" above.
+- **V10** (done) — the gap report + RWM extension write-up V9's own entry
+  flagged as open: `docs/GAP_REPORT.md` v1.0 (20 numbered findings + 5
+  positive findings, ranked recommendations), README.md rewritten as the
+  project's final summary, this document's own closing status note, and a
+  documentation-only consistency pass (`data/README.md`'s stale
+  `perception-v1` section corrected). See "V10 closing status" at the end
+  of this document and `docs/VERIFICATION.md`'s V10 section.
 
 ## Dataset build (V4)
 
@@ -2147,3 +2158,56 @@ subsequent render calls in the same session with `EGL_NOT_INITIALIZED`.
 - Sabotage test (independent verification): reverting the fix reproduces
   `EGLError(EGL_NOT_INITIALIZED)` exactly, confirming the fix addresses
   the root cause, not merely masking symptoms.
+
+## V10 closing status (2026-08-02)
+
+This is the project's final milestone: consolidation and repo polish, no
+new experiments, no training, no GPU runs beyond one final fast-lane
+pytest. Ten milestones (V0-V9.1), each independently verified against a
+different agent than the one that implemented it
+(`docs/VERIFICATION.md`), are complete:
+
+- **Transport** (V1, V9-prep): a real, custom `RWM_state_series` glTF
+  extension plus the draft `KHR_physics_rigid_bodies`/`KHR_implicit_shapes`
+  extensions carry pose, rigid-body physics, joints, and arbitrary
+  time-series state through a single GLB per episode, schema-validated and
+  independently glTF-Validator-clean at every scale this project operated
+  at (10,000+ synthetic episodes, 150 real external-dataset conversions,
+  1,500 articulated episodes -- 0 errors across all of it, one real
+  regression caught and fixed in V8.1).
+- **Simulation -> rendering -> models -> re-emission**, the whole
+  architecture-flow diagram at the top of this document, is real and
+  working end-to-end (V2-V7): MuJoCo generates ground truth, a vendored
+  patched renderer turns glTF into frames, a dynamics model beats a
+  ballistic baseline by 42-176x, a perception model is real but
+  data-limited (honestly reported short of its own acceptance bar), and a
+  closed-loop demo ties both together with a genuine, measured finding
+  about correlated vs. i.i.d. perception noise.
+- **External validation** (V8): a real dataset (Physion) was converted
+  into this transport end-to-end, producing both a strong state-based
+  oracle ceiling (92%) and an honestly-reported zero-shot transfer collapse
+  to chance -- fourteen concrete impedance-mismatch findings from that
+  conversion are the primary evidence base for this project's gap report.
+- **Articulation** (V9-prep, V9): hinged/sliding joints round-trip through
+  the transport; a trained joint-state estimator clears all four
+  acceptance bars.
+- **The gap report** (V10, this milestone): `docs/GAP_REPORT.md` v1.0
+  consolidates every honest gap recorded across V0-V9.1 into 20 numbered
+  findings plus 5 positive findings, each with a code pointer and (where
+  one exists) a measurement, organized by severity and prior-art
+  comparison, closing with ranked recommendations for what a
+  Khronos-track extension effort would need next.
+
+**What remains open, stated plainly** (not silently dropped, per this
+project's own house policy): articulated *dynamics* (predicting how a
+joint's state evolves over time, the V9-counterpart of
+`InteractionTransformer`) was never attempted; perception's full 0.05m/0.95
+F1 acceptance bar was never met at the dataset scale this project trained
+at (`docs/RESULTS.md`'s V6 section is explicit about this); the V9-prep
+EGL crash's root cause was found and fixed in V9.1, but only on this
+project's own development machine's current driver stack (not confirmed
+across other NVIDIA driver versions); and `docs/GAP_REPORT.md`'s own
+recommendations are exactly that -- recommendations for future Khronos-track
+work, not something this project implements itself.
+
+No further milestones are planned after V10.
