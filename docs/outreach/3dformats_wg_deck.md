@@ -3,6 +3,10 @@ marp: true
 theme: default
 paginate: true
 title: "glTF as a World-Model Transport: Findings from an End-to-End Pipeline"
+style: |
+  section { font-size: 24px; }
+  section h2 { font-size: 38px; }
+  table { font-size: 21px; }
 ---
 
 # glTF as a World-Model Transport
@@ -23,8 +27,8 @@ rudybear · github.com/rudybear/glTFWorldModel · MIT
   - Habitat/ReplicaCAD: **GLB for geometry + URDF sidecar** — because glTF lacks joints
   - OpenUSD: UsdPhysics 1.0 shipped in core
   - No published project uses glTF as an ML scene-state transport
-- Question: **how far does glTF 2.0 + draft physics extensions get, and what exactly is missing?**
-- Method: don't read the spec and speculate — **build the whole pipeline and record every impedance mismatch**
+- Question: **how far does glTF 2.0 + draft extensions get — what exactly is missing?**
+- Method: **build the whole pipeline; record every impedance mismatch**
 
 ---
 
@@ -67,7 +71,7 @@ MuJoCo sim ──► GLB episodes ──► headless renderer ──► rgb/seg/
 | G3 | Channels wider than VEC4 | documented chunking convention |
 | G6 | Uncertainty representation **and semantics** | diagonal-variance channel + a measured warning (slide 8) |
 
-**Key point:** ratifying the physics extensions does **not** close G1 — the draft spec explicitly leaves per-frame state to the engine. A time-series extension is a *separate, complementary* need.
+**Key point:** ratifying the physics extensions does **not** close G1 — a time-series extension is a *separate, complementary* need.
 
 ---
 
@@ -78,7 +82,14 @@ We implemented `KHR_physics_rigid_bodies` + `KHR_implicit_shapes` (pinned draft 
 | Gap | Finding | Cost we paid |
 |---|---|---|
 | G7 | **No collider local offset/center** in KHR_implicit_shapes | forced a pivot-child-node design; unavoidable mesh-pivot vs collider-center error in real-asset conversion |
-| G8 | Limit damping is soft-stop only — **no viscous joint damping/armature** | articulated scenes need side-channel metadata; MJCF/URDF express this natively |
+| G8 | Limit damping is soft-stop only — **no viscous joint damping** | articulated scenes need side-channel metadata; MJCF/URDF have this natively |
+
+---
+
+## Gap Part B (continued)
+
+| Gap | Finding | Cost we paid |
+|---|---|---|
 | G9 | Drives model persistent spring-to-target — **no bounded-duration push** | scripted actuation not encodable as a KHR drive at all |
 | G10 | **No fixed/weld joint** | handle attachment is derived, not constrained |
 | G11 | Single friction model vs static+dynamic pairs | measured information loss converting Physion (e.g. 1.0 vs 0.1 collapsed) |
@@ -116,6 +127,11 @@ Real detector errors are **frame-correlated** (lag-1 autocorrelation 0.55–0.82
 2. **Collider local offset in KHR_implicit_shapes** — narrowest fix, outsized payoff
 3. **Joint viscous damping + bounded drive mode** — parity with MJCF/URDF for ordinary actuation
 4. **Fixed/weld joint type**
+
+---
+
+## Recommendations (continued)
+
 5. **Optional mesh/convex-hull collider** — the cost of its absence is measured in our real-asset conversion
 6. **Best-practice guidance: per-frame uncertainty ≠ i.i.d. noise license** (measured 17× cost)
 7. Second friction coefficient; root-level gravity
@@ -129,14 +145,11 @@ Explicitly *not* recommended: video-frame sequences in glTF; widening accessors 
 Our own verification protocol only proves we built what we said we built —
 so we ran two experiments designed to check the claims *from the outside*:
 
-- **Blind spec-only reimplementation.** An implementer with zero access to
-  our source — only `RWM_EXTENSIONS.md` + JSON Schemas + sample GLBs —
-  decoded a whole episode **bitwise-identically**. Getting there required
-  guessing 6 conventions our docs left implicit (object-inclusion on the
-  N axis, array ordering, quaternion order, STEP interpolation, chunked-
-  channel reassembly order, the count==len(times) invariant) — one guess
-  was initially *wrong* and produced silently-wrong shapes. All 6 are now
-  written down as normative.
+- **Blind spec-only reimplementation.** Zero source access — only
+  `RWM_EXTENSIONS.md` + schemas + GLBs — decoded a whole episode
+  **bitwise-identically**. It had to guess 6 conventions our docs left
+  implicit; one was initially *wrong* (silently-wrong shapes). All 6 are
+  now normative.
 - **Clean-room reproduction from the public clone.** A fresh `git clone` +
   documented setup reproduced our smoke-test pass/skip counts and split
   sizes **digit-for-digit**, and seeded dataset generation **bit-identical**
