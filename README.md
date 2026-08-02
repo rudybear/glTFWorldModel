@@ -88,6 +88,10 @@ for the pre-training data-quality gate every model trained against.
   under-specified conventions found and fixed) and a clean-room
   reproduction from the public clone (exact-digit smoke reproduction,
   bit-identical seeded generation, onboarding friction found and fixed).
+- **[docs/proposals/EXT_state_series/](docs/proposals/EXT_state_series/)**
+  — draft KHR-track proposal spec generalizing `RWM_state_series`
+  (pointer-based targeting, normative channel metadata, uncertainty with
+  temporal correlation), with schemas and a migration appendix.
 
 ## Stack
 

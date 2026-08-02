@@ -951,6 +951,11 @@ world-model/robotics transport, ranked by (impact this project measured) x
    standardize the `{node|joint|scene}`-target + shared-time-accessor +
    named-channel pattern this project's own custom extension already
    validates at scale (10,000+ episodes, 0 schema-validation failures).
+   See [docs/proposals/EXT_state_series/](proposals/EXT_state_series/) for
+   a drafted, ballot-ready proposal spec generalizing this pattern to
+   arbitrary JSON-Pointer-addressable targets (aligned with
+   `KHR_animation_pointer`), with schemas and a migration path from this
+   project's own `RWM_state_series`.
 
 2. **Add a local offset/transform field to `KHR_implicit_shapes` colliders**
    (closes G7). The narrowest-scoped, cheapest-to-ratify fix on this list

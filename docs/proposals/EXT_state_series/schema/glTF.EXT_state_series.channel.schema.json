@@ -1,0 +1,104 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "glTF.EXT_state_series.channel.schema.json",
+    "title": "EXT_state_series channel",
+    "type": "object",
+    "description": "One time-series channel: an accessor (count == len(times)) of up to 4 feature dims, describing a `kind`-named quantity about the glTF object identified by `pointer`.",
+    "properties": {
+        "pointer": {
+            "type": "string",
+            "description": "JSON Pointer (RFC 6901) identifying the glTF object this channel's quantity is about, resolved with the same rules KHR_animation_pointer uses for its own `pointer` extension property (traversal through `extensions`/`extras` permitted; a pointer resolves to a location that is defined explicitly or by a present enclosing object's spec default). Unlike KHR_animation_pointer, this identifies an object (e.g. \"/nodes/3\"), not a specific animated property -- `kind` supplies the quantity.",
+            "pattern": "^(/([^/~]|~0|~1)*)*$"
+        },
+        "kind": {
+            "type": "string",
+            "description": "The quantity this channel carries: a registered vocabulary entry, or a vendor-specific x-* kind.",
+            "oneOf": [
+                {
+                    "enum": [
+                        "linear_velocity",
+                        "angular_velocity",
+                        "applied_force",
+                        "applied_torque",
+                        "action",
+                        "joint_position",
+                        "joint_velocity",
+                        "pose_variance"
+                    ]
+                },
+                {
+                    "pattern": "^x-[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$"
+                }
+            ]
+        },
+        "accessor": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Index of the accessor holding this channel's data (SCALAR/VEC2/VEC3/VEC4, float32, count == len(times))."
+        },
+        "component": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "0-based chunk index, present only when a kind's natural feature width exceeds 4 and had to be split across multiple accessors/channels of the same kind+pointer. Decode concatenates chunks in ascending component order."
+        },
+        "units": {
+            "type": "string",
+            "description": "UCUM-style unit string (e.g. \"m/s\", \"rad/s\", \"N\"). If omitted, the kind's registered default unit applies."
+        },
+        "frame": {
+            "enum": ["world", "parent", "local"],
+            "description": "Reference frame of a vector-valued channel's components. Required for linear_velocity/angular_velocity/applied_force/applied_torque/pose_variance; MUST NOT be present for action/joint_position/joint_velocity."
+        },
+        "sampling": {
+            "enum": ["sampled", "interpolable"],
+            "default": "sampled",
+            "description": "\"sampled\" (default): a recorded observation at each times[i], no implied inter-sample interpolation. \"interpolable\": values MAY be meaningfully interpolated between samples."
+        },
+        "temporalCorrelation": {
+            "type": "object",
+            "description": "Optional temporal-correlation metadata, meaningful primarily for pose_variance channels. Absence does NOT imply i.i.d. samples -- it means no claim is made about temporal structure.",
+            "properties": {
+                "model": {
+                    "const": "ar1",
+                    "description": "Correlation model identifier. v0 of this extension defines exactly one: lag-1 autoregressive."
+                },
+                "coefficient": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "For \"ar1\": the lag-1 autocorrelation coefficient."
+                }
+            },
+            "required": ["model", "coefficient"],
+            "additionalProperties": false
+        }
+    },
+    "required": ["pointer", "kind", "accessor"],
+    "additionalProperties": false,
+    "allOf": [
+        {
+            "if": {
+                "properties": {
+                    "kind": {
+                        "enum": ["linear_velocity", "angular_velocity", "applied_force", "applied_torque", "pose_variance"]
+                    }
+                },
+                "required": ["kind"]
+            },
+            "then": { "required": ["frame"] }
+        },
+        {
+            "if": {
+                "properties": {
+                    "kind": {
+                        "enum": ["action", "joint_position", "joint_velocity"]
+                    }
+                },
+                "required": ["kind"]
+            },
+            "then": {
+                "not": { "required": ["frame"] }
+            }
+        }
+    ]
+}
