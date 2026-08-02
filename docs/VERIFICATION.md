@@ -1821,3 +1821,43 @@ account of why checkpoint selection mattered here.
   camera (no viewpoint generalization tested), single-object-per-scene (no
   clutter/occlusion/multi-joint testing), and the three sub-tasks'
   differing optimal stopping points within one shared training run.
+
+## V9.1 -- fix EGL context lifecycle (stale known-issue resolution)
+
+V9 discovered and documented a pre-existing EGL crash that blocked running
+the full test suite in a single process. This brief milestone fixes that
+root cause and re-enables single-process gpu test execution.
+
+### Checkpoint: EGL fix (single-process gpu lane)
+
+- **Purpose**: confirm the EGL context lifecycle bug discovered in V9
+  ("Known issue: `test_crosscheck.py` crashes the full gpu lane") is
+  actually fixed, not merely worked around. Verify that the full gpu test
+  suite passes in a single process and that reverting the fix reproduces
+  the exact same `EGL_NOT_INITIALIZED` error.
+- **Command**: `uv run pytest -m gpu -q`
+- **Expected result**: **18 passed / 1 xfailed** (the xfail is a pre-existing
+  benchmark timeout on non-target-class hardware, unrelated to this fix).
+  No `EGL_NOT_INITIALIZED` errors. The session completes cleanly.
+- **Observed (2026-08-02)**: **18 passed / 1 xfailed** as expected. Session
+  completes without EGL errors.
+
+### Checkpoint: EGL fix (per-module subprocess runner)
+
+- **Purpose**: additionally confirm the defense-in-depth per-module runner
+  (`scripts/run_gpu_tests.sh`) runs all 8 gpu test modules in isolation,
+  fully verifying the fix doesn't have hidden process-only dependencies.
+- **Command**: `./scripts/run_gpu_tests.sh`
+- **Expected result**: all 8 modules pass (exit 0 for each; overall exit 0).
+  Module list: `test_crosscheck.py`, `test_render_analytic.py`,
+  `test_render_bench.py`, `test_data.py`, `test_perception_eval_gpu.py`,
+  `test_train_perception_smoke.py`, `test_train_articulation_smoke.py`,
+  `test_articulation_eval_gpu.py`.
+- **Observed (2026-08-02)**: **8/8 modules pass**.
+
+### Checkpoint: fast lane unchanged
+
+- **Purpose**: confirm this tiny fix didn't break the 350-test fast lane.
+- **Command**: `uv run pytest -m "not gpu" -q`
+- **Expected result**: **350 passed** (the entire non-GPU test suite).
+- **Observed (2026-08-02)**: **350 passed** as expected.

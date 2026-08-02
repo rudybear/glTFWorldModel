@@ -2104,3 +2104,46 @@ what `test_crosscheck.py` does deliberately as its own cross-render oracle.
 Not fixed here (pre-existing V2/V3-era code, orthogonal to V9's own scope);
 flagged here as a genuine, reproducible environment finding rather than
 silently worked around by, e.g., quietly reordering or skipping the test.
+
+### V9.1 addendum (2026-08-02): FIXED
+
+**Confirmed root cause**: `closed_loop.main()` constructed its own
+`EpisodeRenderer` at startup and unconditionally deleted it at shutdown,
+without any try/except guard or awareness that the same process might be
+reusing the same EGL display context elsewhere. The bug manifested when
+pytest's default test collection order (alphabetical by module, then by test
+name within each module) happened to run `test_crosscheck.py`
+(which temporarily creates a MuJoCo renderer within the same process)
+*during* the session-scoped fixture's lifetime -- terminating the shared
+process-wide EGL display in `closed_loop.main()`'s shutdown, leaving all
+subsequent render calls in the same session with `EGL_NOT_INITIALIZED`.
+
+**The fix**: three layers of defense-in-depth:
+
+1. **Renderer injection + `owns_renderer` convention**: `EpisodeRenderer` now
+   accepts an optional `renderer` parameter. When `None`, it constructs and owns
+   the renderer (old behavior); when provided, it uses the injected renderer and
+   does *not* delete it at shutdown. Same pattern `render_check()` and the
+   test suite already established with `test_perception_eval_gpu.py`.
+2. **MuJoCo crosscheck render isolated in spawned subprocess**: `render_mujoco_frame0`
+   now spawns a fresh subprocess for MuJoCo rendering (instead of doing it
+   in-process), completely decoupling its EGL context lifecycle from
+   `EpisodeRenderer`'s.
+3. **Per-module runner as defense-in-depth**: `scripts/run_gpu_tests.sh` runs
+   each test module in its own subprocess, so even if any module has lingering
+   EGL context issues, they don't cascade to the next module.
+
+**Evidence**:
+
+- Single-process `uv run pytest -m gpu -q`: **18 passed / 1 xfailed / 0 failed**
+  (the xfail is pre-existing, unrelated: `test_render_bench.py::test_benchmark`
+  xfails on slower machines; this development box is not in the target perf
+  class). Session completes without `EGL_NOT_INITIALIZED`.
+- Per-module via `scripts/run_gpu_tests.sh`: **8/8 modules pass** (each in its
+  own subprocess: `test_crosscheck.py`, `test_render_analytic.py`,
+  `test_render_bench.py`, `test_data.py`, `test_perception_eval_gpu.py`,
+  `test_train_perception_smoke.py`, `test_train_articulation_smoke.py`,
+  `test_articulation_eval_gpu.py`).
+- Sabotage test (independent verification): reverting the fix reproduces
+  `EGLError(EGL_NOT_INITIALIZED)` exactly, confirming the fix addresses
+  the root cause, not merely masking symptoms.
