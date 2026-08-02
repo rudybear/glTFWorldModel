@@ -161,6 +161,16 @@ def sample_episode() -> Episode:
     return make_sample_episode()
 
 
+# NOTE for anyone tempted to "simplify" CI/local invocations back to a single
+# `uv run pytest -m gpu` process: don't. This fixture's own EGL constraint
+# (below) plus `mujoco.Renderer`'s independent EGL context (used directly in
+# `tests/test_crosscheck.py`) mean more than one EGL-context-owning renderer
+# can end up alive in the same process across a whole-lane run -- the gpu
+# lane must be run as one pytest process *per test module* via
+# `scripts/run_gpu_tests.sh` (see DESIGN.md's V9.1 "known issue" note for the
+# full incident writeup). Collapsing that back into one process silently
+# reintroduces cross-module EGL corruption/crashes that only show up deep
+# into a long run, not at the point anyone would think to look.
 @pytest.fixture(scope="session")
 def episode_renderer():
     """One process-lifetime ``EpisodeRenderer``, shared by every gpu-marked

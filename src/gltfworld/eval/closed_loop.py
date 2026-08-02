@@ -942,7 +942,7 @@ def render_videos(results: list[EpisodeResult], out_dir: Path, renderer) -> None
 # --- CLI -------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="V7 closed-loop demo + 3-arm attribution.")
     parser.add_argument("--episodes", required=True, type=Path, help="glb dir, dataset root, or packed dataset")
     parser.add_argument("--dyn-ckpt", required=True, type=Path)
@@ -958,8 +958,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--video", type=int, default=0, help="render N GT|armC (+3-panel) mp4s (needs GPU)")
     parser.add_argument("--no-perception", action="store_true", help="skip Arm C entirely (CPU-only smoke)")
-    args = parser.parse_args(argv)
+    return parser
 
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
+
+
+def run(args: argparse.Namespace, renderer=None) -> int:
+    """Run the closed-loop demo for already-parsed ``args``.
+
+    ``renderer=`` follows the same reuse convention as
+    ``gltfworld.eval.perception_eval.render_check`` /
+    ``gltfworld.eval.articulation_eval.render_check``: pass an existing,
+    still-open ``EpisodeRenderer`` to reuse it (this function will never
+    delete a renderer it didn't create itself); leave it ``None`` to let
+    this function construct (and, in its own ``finally``, delete) its own --
+    the right default for standalone CLI use, where nothing else in the
+    process holds a renderer open.
+
+    This distinction is load-bearing, not cosmetic: deleting *any*
+    ``EpisodeRenderer``/``OffscreenRenderer`` instance in a process
+    terminates the *shared default* EGL display for every other still-open
+    instance in that same process (see
+    ``tests/conftest.py``'s ``episode_renderer`` fixture docstring). Before
+    this function accepted an injected renderer, ``main()`` always
+    constructed *and unconditionally deleted* its own -- harmless when this
+    is the only renderer in the process (true for a real standalone CLI
+    run), but a real, reproducible bug under pytest's full gpu lane: once
+    some earlier test has already instantiated the shared, session-scoped
+    ``episode_renderer`` fixture, this function's own delete-in-`finally`
+    tears down the shared EGL display out from under it, and every
+    render-dependent test that runs afterward in the same session fails
+    with ``EGLError: EGL_NOT_INITIALIZED`` -- confirmed as the actual cause
+    of the V9-era full-gpu-lane redness (see DESIGN.md's V9.1 note): the
+    failure only appeared once a new V9 test (`test_articulation_eval_gpu.py`,
+    which sorts alphabetically before `test_closed_loop_gpu.py`) became the
+    first test in the session to instantiate the shared fixture, exposing
+    this pre-existing (V7-era) lifecycle bug for the first time.
+    """
     args.out.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -972,12 +1009,14 @@ def main(argv: list[str] | None = None) -> int:
 
     dyn_model, _dyn_type = _load_dynamics_model(args.dyn_ckpt, device)
     per_model = None
-    renderer = None
+    owns_renderer = False
     if not args.no_perception:
         per_model = _load_perception_model(args.per_ckpt, device)
-        from gltfworld.render.renderer import EpisodeRenderer
+        if renderer is None:
+            from gltfworld.render.renderer import EpisodeRenderer
 
-        renderer = EpisodeRenderer(width=256, height=256)
+            renderer = EpisodeRenderer(width=256, height=256)
+            owns_renderer = True
 
     try:
         results = []
@@ -1003,10 +1042,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--video needs Arm C's renderer; do not pass --no-perception")
             render_videos(results[: args.video], args.out, renderer)
     finally:
-        if renderer is not None:
+        if owns_renderer and renderer is not None:
             renderer.delete()
 
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run(parse_args(argv))
 
 
 if __name__ == "__main__":

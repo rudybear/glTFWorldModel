@@ -35,14 +35,24 @@ def _require_real_assets() -> None:
         pytest.skip(f"missing real assets for closed-loop smoke: {missing}")
 
 
-def test_closed_loop_cli_end_to_end_3_episodes(tmp_path: Path):
+def test_closed_loop_cli_end_to_end_3_episodes(tmp_path: Path, episode_renderer):
     _require_real_assets()
 
     from gltfworld.cli import run_validator
-    from gltfworld.eval.closed_loop import main
+    from gltfworld.eval.closed_loop import parse_args, run
 
+    # Pass the shared, session-scoped `episode_renderer` fixture through
+    # explicitly (the same `renderer=` reuse convention
+    # `test_perception_eval_gpu.py`/`test_articulation_eval_gpu.py` already
+    # use) rather than calling `main()` directly, which would construct
+    # *and unconditionally delete* its own independent `EpisodeRenderer` --
+    # fatal under pytest once any other renderer (this fixture) is already
+    # alive in the same process, since deleting any one instance terminates
+    # the shared default EGL display for every other still-open instance.
+    # See `gltfworld.eval.closed_loop.run`'s own docstring for the full
+    # story (confirmed root cause of the V9-era full-gpu-lane redness).
     out_dir = tmp_path / "closed-loop"
-    exit_code = main(
+    args = parse_args(
         [
             "--episodes", str(DATA_DIR),
             "--dyn-ckpt", str(DYN_CKPT),
@@ -56,6 +66,7 @@ def test_closed_loop_cli_end_to_end_3_episodes(tmp_path: Path):
             "--seed", "0",
         ]
     )
+    exit_code = run(args, renderer=episode_renderer)
     assert exit_code == 0
 
     metrics_path = out_dir / "metrics.json"

@@ -9,6 +9,7 @@ Requires the ``sim`` extra (``mujoco>=3.1``); import lazily / guard with
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,6 +164,107 @@ def render_mujoco_frame0(episode: Episode, width: int = 256, height: int = 256) 
     return MujocoFrame(rgb=rgb, depth=depth, geom_id=geom_id, geom_id_to_object_id=geom_id_to_object_id)
 
 
+# --- process isolation -------------------------------------------------------------
+#
+# Confirmed root cause (see DESIGN.md's V9 "known issue" note and
+# `tests/test_crosscheck.py`): `mujoco.Renderer` owns its own EGL context,
+# and creating/using one in the same OS process as `EpisodeRenderer`'s
+# already-open EGL context deterministically **crashes the whole process**
+# (not a catchable Python exception -- confirmed empirically: running
+# `test_crosscheck_binary_silhouette_iou` alone, in a fresh pytest process,
+# terminates the pytest process itself with no traceback/report at all, the
+# signature of an OS-level crash such as a segfault deep in the GL driver,
+# not a Python-level error). No amount of try/except inside one process can
+# make that safe -- the two EGL-context-owning libraries must never
+# initialize inside the same process at all.
+#
+# The fix: run `render_mujoco_frame0` in a genuinely separate, `spawn`-started
+# subprocess (not `fork`, which would copy this process's already-initialized
+# GL/EGL memory state into the child and could reproduce the same crash) --
+# so MuJoCo's EGL context always lives alone in its own process, and
+# `EpisodeRenderer`'s EGL context in the caller's process is never in the
+# same address space as a second one.
+
+
+def _render_mujoco_frame0_worker(episode: Episode, width: int, height: int, conn) -> None:
+    """Subprocess entry point: render frame 0 with MuJoCo and send the result
+    (or a serialized error) back over ``conn``. Runs alone in its own
+    process -- see the module-level note above for why."""
+    try:
+        frame = render_mujoco_frame0(episode, width=width, height=height)
+    except BaseException as exc:  # noqa: BLE001 - re-raised (as a RuntimeError) in the parent
+        import traceback
+
+        try:
+            conn.send(("error", (type(exc).__name__, str(exc), traceback.format_exc())))
+        finally:
+            conn.close()
+        return
+    try:
+        conn.send(("ok", frame))
+    finally:
+        conn.close()
+
+
+def render_mujoco_frame0_isolated(
+    episode: Episode, width: int = 256, height: int = 256, timeout: float = 120.0
+) -> MujocoFrame:
+    """Render frame 0 of ``episode`` with MuJoCo in a fresh, ``spawn``-started
+    subprocess, so the second EGL context this needs never lives in the
+    caller's own process alongside a possibly-already-open
+    `EpisodeRenderer` context (see the module-level note above --
+    ``crosscheck_frame0`` calls this, not `render_mujoco_frame0`, for
+    exactly that reason).
+
+    Raises ``RuntimeError`` if the subprocess raised an exception, exited
+    without producing a result (e.g. an OS-level crash, which -- pre-fix --
+    is exactly what happened when this render ran in-process, see
+    `test_crosscheck.py`), or exceeded ``timeout`` seconds.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_render_mujoco_frame0_worker,
+        args=(episode, width, height, child_conn),
+        daemon=True,
+    )
+    proc.start()
+    child_conn.close()  # only the child should hold the writable end open
+
+    status: str
+    payload = None
+    try:
+        if not parent_conn.poll(timeout):
+            status = "timeout"
+        else:
+            try:
+                status, payload = parent_conn.recv()
+            except EOFError:
+                status = "crashed"
+    finally:
+        parent_conn.close()
+
+    proc.join(10)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+
+    if status == "timeout":
+        raise RuntimeError(
+            f"isolated MuJoCo render subprocess did not respond within {timeout}s (exitcode={proc.exitcode})"
+        )
+    if status == "crashed":
+        raise RuntimeError(
+            "isolated MuJoCo render subprocess exited without a result "
+            f"(exitcode={proc.exitcode}) -- likely an OS-level GPU/EGL crash"
+        )
+    if status == "error":
+        name, message, tb = payload
+        raise RuntimeError(f"isolated MuJoCo render subprocess raised {name}: {message}\n{tb}")
+    assert status == "ok"
+    return payload
+
+
 # --- comparison -------------------------------------------------------------------
 
 
@@ -197,13 +299,19 @@ def crosscheck_frame0(episode: Episode, episode_renderer, width: int = 256, heig
     ``episode_renderer`` must already have ``width == height == (width,
     height)`` here (reuse the process's single persistent renderer -- see
     `EpisodeRenderer`'s process-lifetime constraint).
+
+    The MuJoCo half of this comparison runs in its own spawned subprocess
+    (`render_mujoco_frame0_isolated`), never in this process alongside
+    ``episode_renderer``'s own EGL context -- see the module-level note
+    above `render_mujoco_frame0_isolated` for why that's load-bearing, not
+    just an optimization.
     """
     episode_renderer.load(episode)
     episode_renderer.set_frame(0)
     gltf_frame = episode_renderer.render()
     gltf_mask = gltf_frame.depth > 0.0
 
-    mj_frame = render_mujoco_frame0(episode, width=width, height=height)
+    mj_frame = render_mujoco_frame0_isolated(episode, width=width, height=height)
     mj_mask = mj_frame.geom_id != -1
 
     iou, _ = _iou(gltf_mask, mj_mask)
