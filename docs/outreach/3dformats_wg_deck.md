@@ -140,14 +140,46 @@ Explicitly *not* recommended: video-frame sequences in glTF; widening accessors 
 
 ---
 
-## Proposal: EXT_state_series
+## Proposal: EXT_state_series — what it looks like
 
-We drafted a ballot-ready KHR-track proposal generalizing `RWM_state_series` — full spec, schemas, examples: **`docs/proposals/EXT_state_series/`**
+Ballot-ready draft (spec + JSON Schemas + examples): **`docs/proposals/EXT_state_series/`**
 
-- **Pointer-based targeting**, aligned with `KHR_animation_pointer`: channels target *any* JSON-Pointer-addressable object (node/material/camera/joint), not just rigid-body nodes
-- **Normative channel metadata born from measured ambiguity**: required `frame` per vector kind — the real cost of a body-frame vs. world-frame angular-velocity mixup we hit converting MuJoCo output
-- **Uncertainty with temporal correlation**: optional AR(1) `temporalCorrelation` on `pose_variance` — puts the 17× i.i.d.-vs-real evidence (previous slide) directly into the schema, not just prose
-- **Deliberately narrow scope**: no streaming, no ragged event channels, no video — conventions/sidecars already suffice (this report's own findings)
+```json
+"extensions": { "EXT_state_series": {
+  "version": "1.0.0-draft.1", "timesAccessor": 10,
+  "channels": [
+    { "pointer": "/nodes/0",  "kind": "linear_velocity",  "accessor": 11, "frame": "world" },
+    { "pointer": "/extensions/KHR_physics_rigid_bodies/physicsJoints/2",
+      "kind": "joint_position", "accessor": 22 },
+    { "pointer": "/nodes/0",  "kind": "pose_variance", "accessor": 15, "component": 0,
+      "frame": "world", "temporalCorrelation": { "model": "ar1", "coefficient": 0.71 } },
+    { "pointer": "/scenes/0", "kind": "action", "accessor": 17 }
+  ] } }
+```
+
+One shared time accessor; channels target **any JSON-Pointer-addressable object** (resolution rules = `KHR_animation_pointer`); `kind` supplies the quantity. `extensionsUsed` only — never `Required`.
+
+---
+
+## EXT_state_series — vocabulary & normative core
+
+| kind | width | units | frame |
+|---|---|---|---|
+| `linear_velocity` / `angular_velocity` | VEC3 | m/s, rad/s | **required** |
+| `applied_force` / `applied_torque` | VEC3 | N, N·m | **required** |
+| `joint_position` / `joint_velocity` | SCALAR | rad or m (per joint type) | forbidden |
+| `action` | task-defined, chunked >4 | producer-defined | forbidden |
+| `pose_variance` | 7 → 2 chunks | m², unitless | required |
+| `x-*` (vendor) | vendor | vendor | vendor — unknown kinds MUST be ignored |
+
+---
+
+## EXT_state_series — normative core
+
+- **6 normative decoder conventions** (object inclusion, ordering-by-pointer-index, xyzw quaternions, STEP interpolation, chunk order, count==len(times)) — each one exists because a blind implementer had to guess it
+- **`temporalCorrelation` (AR(1))** on uncertainty channels — the 17× i.i.d.-vs-real evidence, in-schema; absence of the field ≠ license to assume i.i.d.
+- **Non-goals**: streaming, ragged event channels, video — conventions/sidecars suffice, per this project's own measured findings
+- **Conformance = the blind-reimplementation protocol**, not schema validation alone — bitwise reproduction from spec + schemas + samples
 
 ---
 
