@@ -7,6 +7,8 @@ style: |
   section { font-size: 24px; }
   section h2 { font-size: 38px; }
   table { font-size: 21px; }
+  img { display: block; margin-left: auto; margin-right: auto; }
+  section .caption { font-size: 19px; color: #555; }
 ---
 
 # glTF as a World-Model Transport
@@ -15,20 +17,52 @@ style: |
 **Khronos 3D Formats WG presentation**
 rudybear · github.com/rudybear/glTFWorldModel · MIT
 
-*Every finding in this deck has a code pointer and a measurement in the public repo.*
+*Every finding in this deck has a code pointer and a measurement in the public repo. Every image is real data from the repo's own experiments.*
 
 ---
 
-## Why this experiment
+## First: what is a "world model"? (no ML background needed)
 
-- World models & robotics need a **scene-state interchange**: simulation → training → inference → rendering
-- Today's reality: everyone invents a container
-  - Physion (NeurIPS benchmark): bespoke HDF5 + MP4 + CSV
-  - Habitat/ReplicaCAD: **GLB for geometry + URDF sidecar** — because glTF lacks joints
-  - OpenUSD: UsdPhysics 1.0 shipped in core
-  - No published project uses glTF as an ML scene-state transport
+- A **world model** is a program that predicts what happens next in a 3D scene — like a game engine's physics, except **nobody writes the rules**: the program works them out from thousands of recorded example scenes
+- It has two learned parts:
+  - **Perception** — looks at a rendered image and answers *"which objects are where?"*
+  - **Dynamics** — given where everything is now, predicts where everything is one frame later
+- **"Training"** = showing these programs tens of thousands of recorded scenes.
+  **"Inference"** = running them afterward on scenes they have never seen
+- Robots use exactly this to plan (*"if I push the door, what happens?"*); digital twins use it to forecast; generative 3D uses it to animate plausibly
+
+---
+
+## Why glTF? (yes, USD exists)
+
+- **USD already serves much of this space** — UsdPhysics 1.0 ships in OpenUSD core, and the big robotics simulators are USD-heavy. That's fine.
+- **But the demand we see comes from the glTF community**: web-first runtimes, asset pipelines, and viewers that are already glTF end-to-end — and don't want to adopt a second scene format just to carry state
+- Their options today: a USD/URDF **sidecar** next to every GLB, or a **bespoke container** — both break the *"one file, opens anywhere"* property glTF is loved for
+- This project asks: **what would it take for glTF itself to carry dynamic scene state?**
+
+---
+
+## Everyone invents a container today
+
+- Physion (NeurIPS physics benchmark): bespoke HDF5 + MP4 + CSV
+- Habitat/ReplicaCAD: **GLB for geometry + URDF sidecar** — because glTF lacks joints
+- OpenUSD: UsdPhysics 1.0 in core — the mature yardstick we compare against
+- No published project uses glTF as an ML scene-state transport
 - Question: **how far does glTF 2.0 + draft extensions get — what exactly is missing?**
 - Method: **build the whole pipeline; record every impedance mismatch**
+
+---
+
+## The full loop, step by step
+
+1. A physics **simulator** produces ground-truth scenes: objects falling, colliding, doors opening
+2. Every scene, at every timestep, is saved as a **GLB**: geometry + standard pose animation + draft physics extensions + our state extension
+3. A **renderer** turns those GLBs into images (plus per-pixel object masks and depth)
+4. The two models **train** on those images and files
+5. Afterward, on scenes they have never seen: **perception** reads an image and *writes a GLB of what it sees*; **dynamics** reads that GLB and *writes a GLB of the predicted future*
+6. The predicted GLB **renders like any other glTF file** — the loop closes in the format it started in
+
+**Every arrow above is a plain, validator-clean glTF file you can drag into a viewer.**
 
 ---
 
@@ -52,6 +86,54 @@ MuJoCo sim ──► GLB episodes ──► headless renderer ──► rgb/seg/
 
 ---
 
+## What the training data looks like
+
+![w:1050](assets/pipeline_frame_rgb_seg_depth.png)
+
+One stored training frame (`perception-v1`, episode 55): the renderer produces the color image, a per-pixel **object-identity mask**, and **depth** — all three derived from the same GLB. 400,000 frames like this were generated, all from files any glTF viewer can open.
+
+---
+
+## Two independent renderers, one file
+
+![w:950](assets/crosscheck_side_by_side.png)
+
+The same GLB rendered by **our renderer** and by **MuJoCo** (an independent engine that never saw our code): silhouette agreement IoU **0.992**, all five objects at per-object IoU 1.000. The *file*, not shared code, carries the scene.
+
+---
+
+## Did the models learn? Dynamics, measured
+
+![w:760](assets/divergence_curve.png)
+
+Median position error vs. prediction horizon (log scale), held-out scenes. The learned dynamics model stays **42× closer** to the truth than physics-free constant-velocity extrapolation at 1 second, **176×** at 3.3 seconds.
+
+---
+
+## The closed loop, in pictures
+
+![h:450](assets/closed_loop_strip.png)
+
+Ground truth | rollout from a **perfect** initial state | the **full visual loop** (models only ever saw images). Every state along the way was written and re-read as a GLB.
+
+---
+
+## What the trained perception sees
+
+![h:430](assets/gt_vs_pred_perception.png)
+
+Left: a real rendered frame. Right: the re-render of **the GLB the perception model wrote** after looking at it. Median position error 0.18 m — an honest miss vs. our 0.05 m target (colors copied from matched GT; the detector doesn't predict color).
+
+---
+
+## Articulation: doors that open
+
+![w:1050](assets/door_opening_strip.png)
+
+A hinged cabinet door opening under a scripted push (joint angle 14° → 112°), from the articulated dataset. The joint, its limits, and its per-frame angle all travel **inside the GLB** (draft KHR joints + a `joint_position` state channel). The trained joint-state estimator passed all four accuracy bars (hinge 3.35°, slider 1.45 cm, type 0.982, axis 1.84°).
+
+---
+
 ## What glTF got RIGHT for this use (5 positive findings)
 
 1. **Accessor/bufferView machinery is a general typed time-series transport** — our custom state channels reuse it unchanged; zero schema failures across 10k+ episodes
@@ -69,7 +151,7 @@ MuJoCo sim ──► GLB episodes ──► headless renderer ──► rgb/seg/
 | G1 | Velocity, action, uncertainty, joint state — **any** non-pose per-frame quantity | `RWM_state_series` (custom): named channels over ordinary accessors sharing the animation's time accessor |
 | G2 | Physics initial conditions (mass, friction, colliders) | draft KHR extensions (next slide) |
 | G3 | Channels wider than VEC4 | documented chunking convention |
-| G6 | Uncertainty representation **and semantics** | diagonal-variance channel + a measured warning (slide 8) |
+| G6 | Uncertainty representation **and semantics** | diagonal-variance channel + a measured warning (later slide) |
 
 **Key point:** ratifying the physics extensions does **not** close G1 — a time-series extension is a *separate, complementary* need.
 
@@ -107,6 +189,14 @@ Converted 150 trials of a real NeurIPS physics benchmark (ThreeDWorld HDF5) into
 
 ---
 
+## A Physion trial, opened as glTF
+
+![h:400](assets/physion_converted_render.png)
+
+Converted trial `collision_yeet_box_1_dis_1_occ_0008`, frame 0 — real benchmark geometry, poses, and camera in a validator-clean GLB. Telling finding: **the source format has no concept of lights** — an as-converted render is pitch black (light rig added at view time only). What a format doesn't standardize, someone downstream re-invents.
+
+---
+
 ## A measured warning about uncertainty channels (G6)
 
 Closed-loop experiment, 3 arms: oracle state / oracle + i.i.d. noise matched to measured perception error / real perception in the loop.
@@ -118,6 +208,14 @@ Closed-loop experiment, 3 arms: oracle state / oracle + i.i.d. noise matched to 
 | **real** perception loop | **1.62 m** |
 
 Real detector errors are **frame-correlated** (lag-1 autocorrelation 0.55–0.82) and largely cancel in finite-difference velocity estimation. An i.i.d.-calibrated uncertainty channel **overestimates closed-loop degradation 17×** — any future uncertainty extension should carry or at least warn about temporal correlation.
+
+---
+
+## The 17× finding, as a picture
+
+![w:780](assets/attribution.png)
+
+Median position error vs. rollout horizon, per arm. The i.i.d.-noise arm — calibrated to the **correct** per-frame error magnitude — diverges past everything, while the real visual loop stays bounded. The wrong *correlation assumption*, not the wrong error size, dominates.
 
 ---
 
@@ -161,6 +259,25 @@ One shared time accessor; channels target **any JSON-Pointer-addressable object*
 
 ---
 
+## The schema — and what changes for glTF
+
+```json
+// glTF.EXT_state_series.channel.schema.json (excerpt, draft 2020-12)
+"pointer":  { "type": "string", "pattern": "^(/([^/~]|~0|~1)*)*$" },
+"kind":     { "oneOf": [ { "enum": [ "linear_velocity", "angular_velocity",
+              "applied_force", "applied_torque", "action",
+              "joint_position", "joint_velocity", "pose_variance" ] },
+            { "pattern": "^x-[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$" } ] },
+"accessor": { "type": "integer", "minimum": 0 },
+"frame":    { "enum": ["world", "parent", "local"] },
+"sampling": { "enum": ["sampled", "interpolable"], "default": "sampled" },
+"temporalCorrelation": { "model": "ar1", "coefficient": 0.71 }
+```
+
+**What changes for glTF: nothing in core.** One additive root extension over accessors glTF already has; `extensionsUsed` only; today's validator reports 0 errors on these files and today's viewers are unaffected. Full root + channel schemas ship in the proposal directory.
+
+---
+
 ## EXT_state_series — vocabulary & normative core
 
 | kind | width | units | frame |
@@ -197,25 +314,12 @@ Not just a proposal document — a working system to ratify against:
 
 ## External validity: we tested ourselves
 
-Our own verification protocol only proves we built what we said we built —
-so we ran two experiments designed to check the claims *from the outside*:
+Our own verification protocol only proves we built what we said we built — so we ran two experiments checking the claims *from the outside*:
 
-- **Blind spec-only reimplementation.** Zero source access — only
-  `RWM_EXTENSIONS.md` + schemas + GLBs — decoded a whole episode
-  **bitwise-identically**. It had to guess 6 conventions our docs left
-  implicit; one was initially *wrong* (silently-wrong shapes). All 6 are
-  now normative.
-- **Clean-room reproduction from the public clone.** A fresh `git clone` +
-  documented setup reproduced our smoke-test pass/skip counts and split
-  sizes **digit-for-digit**, and seeded dataset generation **bit-identical**
-  across machines.
+- **Blind spec-only reimplementation.** Zero source access — only `RWM_EXTENSIONS.md` + schemas + GLBs — decoded a whole episode **bitwise-identically**. It had to guess 6 conventions our docs left implicit; one was initially *wrong* (silently-wrong shapes). All 6 are now normative.
+- **Clean-room reproduction from the public clone.** A fresh `git clone` + documented setup reproduced our smoke-test pass/skip counts and split sizes **digit-for-digit**, and seeded dataset generation **bit-identical** across machines.
 
-**This is exactly what a ratification process exists to surface** —
-ambiguities an author blind to their own tacit assumptions can't see in
-their own writing. Two cheap experiments found 6 normative gaps in a spec
-we thought was complete. That's the argument for taking the
-`RWM_state_series` pattern to a real KHR track rather than shipping it as
-one repo's permanent custom extension.
+**This is exactly what a ratification process exists to surface** — ambiguities an author can't see in their own writing. Two cheap experiments found 6 normative gaps in a spec we thought was complete. That's the argument for a real KHR track over a permanent custom extension.
 
 ---
 
