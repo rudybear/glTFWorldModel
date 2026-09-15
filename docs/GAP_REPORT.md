@@ -158,6 +158,42 @@ external DCC/animation system) rather than a general "arbitrary simulator
 output channel" concept either — this is a genuinely unaddressed space, not
 just glTF lagging behind an existing solution.
 
+**Refinement (2026-09-14, post-publication review).** G1 as originally
+written overstates the gap in one respect, and this report failed to
+evaluate one ratified extension at all: `KHR_animation_pointer` appears
+nowhere in v1.0 of this report — an omission surfaced by a reviewer's
+question ("isn't `KHR_animation_pointer` enough?"). Verified against the
+primary spec texts:
+
+- `KHR_animation_pointer` (ratified) lets an animation target "any mutable
+  property in a glTF asset," gated only by Object-Model mutability — and
+  the draft `KHR_physics_rigid_bodies` itself publishes pointer templates
+  declaring `motion/linearVelocity`, `motion/angularVelocity`, and joint
+  drive `positionTarget`/`velocityTarget` mutable. A time-varying velocity
+  or drive-target track is therefore expressible in glTF **today** — so
+  G1's sentence "*no home anywhere in the base spec, draft or shipped*" is
+  wrong for those specific quantities as prescriptive tracks.
+- What survives, and is now G1's corrected scope: **glTF has no
+  observation plane** — every time-varying mechanism in glTF, core
+  animation and pointer alike, is *prescriptive* (applied by players; the
+  physics draft states animations "should take priority over the physics
+  simulation," so a measured-velocity log written as an animation becomes
+  a kinematic command). Within one animation a target "MUST NOT be used
+  more than once" and cross-animation same-property behavior is
+  explicitly runtime-undefined, so ground-truth + predicted + uncertainty
+  tracks cannot coexist as pointer animation. And no mutable property
+  exists at all for applied actions, pose uncertainty, *measured* joint
+  position (drive targets are commands), or contact events.
+- Severity unchanged (Blocking) for recorded/observed state. The
+  `EXT_state_series` proposal gained a "Relationship to
+  `KHR_animation_pointer`" section with the full spec-quoted analysis and
+  a normative rule: settable properties SHOULD use pointer animation;
+  `EXT_state_series` is exclusively the descriptive plane.
+
+This is exactly the class of correction §Recommendations #1 predicts a
+real ratification process would surface — recorded here visibly, per this
+project's correction policy.
+
 ### G2. Khronos's own physics extensions cover initial conditions, not time series
 
 **What glTF lacks**: `KHR_physics_rigid_bodies`/`KHR_implicit_shapes` (both
