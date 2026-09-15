@@ -205,6 +205,32 @@ animation) and SHOULD NOT mirror them as `EXT_state_series` channels.
 `EXT_state_series` is exclusively the *descriptive* plane: recorded,
 sampled observations.
 
+**This extension defines no mutable properties.** For the purposes of the
+glTF 2.0 Asset Object Model, nothing inside `EXT_state_series` — the root
+extension object, its `channels[]`, or the data their accessors hold — is
+a valid `KHR_animation_pointer` target. Channels are records; animating a
+record is a category error, and consumers MUST ignore any animation
+channel whose pointer resolves into this extension.
+
+**Routing recorded commands.** A recorded *command* (an input that was
+sent to the scene, as opposed to an observation of it) that corresponds to
+a mutable property — e.g., a joint drive's `positionTarget` or
+`velocityTarget` in `KHR_physics_rigid_bodies` — MAY be encoded as a
+`KHR_animation_pointer` animation instead of, or alongside, an
+`EXT_state_series` channel. The pointer-animation form is *replayable*:
+fed back to a conformant physics runtime, it re-drives the scene, which is
+frequently the desired semantics for a command log. The `action` kind
+remains for task-level or abstract commands that correspond to no mutable
+property. When both encodings of the same command are present, the
+pointer-animation form is authoritative for playback and the channel form
+for analysis; producers SHOULD keep them numerically identical.
+
+**Open style question for WG review**: this draft's `kind` values use
+`snake_case` (`linear_velocity`); glTF precedent is mixed (`"STEP"`
+interpolation enums vs. `KHR_lights_punctual`'s lowercase `"directional"`).
+The vocabulary's casing is a ratification-time bikeshed this draft
+deliberately leaves to the working group.
+
 ### Registered kind vocabulary
 
 | `kind` | Width | Default units | `frame` | Notes |
