@@ -148,7 +148,7 @@ A hinged cabinet door opening under a scripted push (joint angle 14° → 112°)
 
 | Gap | What's missing | Our workaround |
 |---|---|---|
-| G1 | Velocity, action, uncertainty, joint state — **any** non-pose per-frame quantity | `RWM_state_series` (custom): named channels over ordinary accessors sharing the animation's time accessor |
+| G1 | A **recorded-observation plane**: measured velocities, actions, uncertainty, joint measurements — everything time-varying in glTF (incl. via ratified `KHR_animation_pointer`) is *prescriptive*, applied by players | `RWM_state_series` (custom): *descriptive* channels over ordinary accessors sharing the animation's time accessor |
 | G2 | Physics initial conditions (mass, friction, colliders) | draft KHR extensions (next slide) |
 | G3 | Channels wider than VEC4 | documented chunking convention |
 | G6 | Uncertainty representation **and semantics** | diagonal-variance channel + a measured warning (later slide) |

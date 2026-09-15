@@ -41,7 +41,7 @@ We built the entire loop with **glTF as the only interchange**: physics sim → 
 
 - **It works — via extensions.** Standard glTF carries geometry and pose animation; draft Khronos physics extensions carry mass/friction/colliders/joints; everything else needed a custom extension we wrote (`EXT_state_series`, now a ballot-ready draft proposal)
 - **glTF's superpower is distribution**: one royalty-free spec, one validator with a hard "passes ⇒ renders" guarantee, many independent implementations, opens natively in any browser
-- **glTF's blind spot is dynamic state**: core glTF can animate only position/rotation/scale — velocities, joint angles, actions, and uncertainty have *no native home*
+- **glTF's blind spot is *recorded* state**: animation — even via the ratified `KHR_animation_pointer`, which can time-vary any settable property — is *prescriptive*: players apply it. Measured velocities, actions, joint observations, and uncertainty need a *descriptive* channel consumers never execute — that had no home
 - Cost of that blind spot, measured: 20 documented gaps, each with a workaround we had to build and validate ourselves
 
 ---
@@ -57,10 +57,11 @@ We built the entire loop with **glTF as the only interchange**: physics sim → 
 
 ## USD in 2026: the world-model data story — look closely
 
-- USD attributes natively support **timeSamples** — time-varying values on *any* attribute. Architecturally, exactly what glTF lacks
+- USD: **timeSamples** put time-varying values on *any* attribute — including custom ones invented ad hoc, no schema needed
+- glTF: animation + ratified `KHR_animation_pointer` time-vary any **settable** property — but all of it *prescriptively*: there is **no observation plane**, and no properties exist for actions, uncertainty, or measurements
 - **But no standard says what recorded simulation state should look like.** AOUSD runs five working groups (Core Spec, Materials, Geometry, Marketing, Physics) — none for simulation state or ML data
 - The revealing detail: **NVIDIA's own PhysicalAI datasets** ship USD/USDZ scenes with dynamic trajectories in **companion JSON sidecar files** — not USD timeSamples
-- **Cosmos 3** (NVIDIA's world foundation model, June 2026) consumes **video + action tokens + language** — USD appears upstream as the scene-authoring substrate that gets *rendered into* training video, not as the model's state format
+- **Cosmos 3** (NVIDIA's world foundation model, June 2026) consumes **video + action tokens + language** — USD sits upstream (scenes get *rendered into* training video), not as the model's state format
 - We found **no published ML pipeline using USD as the sim→train→inference state transport** — the same "nobody" we found for glTF
 
 ---
@@ -84,7 +85,7 @@ The last row is the finding. Both ecosystems solved *describing a scene*; neithe
 
 | Dimension | Advantage | Why |
 |---|---|---|
-| Time-varying data plumbing | **USD** | native timeSamples on any attribute; glTF needs an extension |
+| Time-varying data plumbing | **USD** | timeSamples on any attribute, incl. custom; glTF + `KHR_animation_pointer` covers *settable* properties only — recorded observations still need an extension |
 | Physics maturity | **USD** | ratified Core Spec 1.0 + drives/articulations vs. glTF's drafts |
 | Semantic labeling | **USD** | a real schema vs. free-form `extras` |
 | Interop guarantee | **glTF** | one validator, "passes ⇒ renders"; USD validation checks schema conformance only |

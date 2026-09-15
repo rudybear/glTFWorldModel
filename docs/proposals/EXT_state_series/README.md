@@ -39,12 +39,18 @@ animation correctly.
 ## Overview
 
 Core glTF's `animation` object interpolates a node's `translation`,
-`rotation`, `scale`, or (via `KHR_animation_pointer`) any other pointer-
+`rotation`, `scale`, or (via `KHR_animation_pointer`) any other *mutable* pointer-
 addressable property, over time. It has no concept of a *recorded, sampled
-observation* about an object that is not itself a settable glTF property —
-a rigid body's linear or angular velocity, an applied force/torque, a
-discrete action taken by an agent, a joint's generalized position, or an
-estimate of pose uncertainty. `EXT_state_series` fills that gap: a root-
+observation* — a value describing what *happened or was measured*, as
+opposed to a value a player should *apply*. The distinction is not "pose
+vs. non-pose": the draft `KHR_physics_rigid_bodies` publishes Object Model
+pointer templates making `motion.linearVelocity`/`angularVelocity` and
+joint drive targets mutable, so a *prescriptive* velocity track is already
+expressible via `KHR_animation_pointer`. What has no home is the
+*descriptive* counterpart — a measured velocity history, an applied
+action, a joint's observed position, an estimate of pose uncertainty:
+quantities a consumer must read but never execute (see "Relationship to
+`KHR_animation_pointer`" below). `EXT_state_series` fills that gap: a root-
 level glTF extension carrying named, time-sampled channels of arbitrary
 (non-pose) per-object state, sharing a single time accessor with any
 co-existing pose animation.
@@ -150,12 +156,61 @@ Episode/scene-wide channels (a quantity that is not about any single
 object, e.g. a discrete per-frame `action` an external agent took) target
 the document's active scene, e.g. `"pointer": "/scenes/0"`.
 
+### Relationship to `KHR_animation_pointer` (and why animation is not sufficient)
+
+The first question a reviewer should ask — and one a post-publication
+review did ask — is whether the ratified `KHR_animation_pointer` already
+covers this ground. It permits an animation to target "any mutable
+property in a glTF asset" (its gate: the property "MUST be mutable as
+defined by the glTF 2.0 Asset Object Model"), and `KHR_physics_rigid_bodies`
+publishes Object Model pointer templates for `motion/linearVelocity`,
+`motion/angularVelocity`, and joint drive `positionTarget`/`velocityTarget`.
+A time-varying velocity or drive-target track is therefore expressible in
+glTF **today**, with no new extension.
+
+`EXT_state_series` exists because that mechanism is the wrong *plane* for
+recordings, for four reasons grounded in the specs' own text:
+
+1. **Animation is prescriptive.** Players apply it; `KHR_physics_rigid_bodies`
+   states that animations "should take priority over the physics
+   simulation." A measured-velocity log encoded as a pointer animation is
+   indistinguishable from kinematic velocity *control* — a physics-aware
+   importer will drive the scene with the measurements. Observation data
+   must be readable without ever being executed.
+2. **No multi-track coexistence.** Core glTF: within one animation a target
+   "MUST NOT be used more than once"; across animations, same-property
+   behavior is explicitly left runtime-undefined. Ground truth, a model's
+   prediction, and that prediction's variance for one object therefore
+   cannot coexist as pointer tracks; as `EXT_state_series` channels they
+   are simply parallel data.
+3. **The observation vocabulary has no properties.** No mutable property
+   exists for applied actions, pose uncertainty, *measured* joint position
+   (drive targets are commands, not observations), or contact phenomena —
+   a pointer needs something to point at, and defining those properties
+   would itself require an extension.
+4. **No observation metadata.** Animation samplers carry no units,
+   reference frame, sampled-vs-interpolable semantics, or temporal-
+   correlation structure — precisely the conventions whose absence this
+   project measured as silent-corruption risks.
+
+**Considered alternative (rejected):** define the missing quantities as
+static extension properties and animate them via `KHR_animation_pointer`.
+This costs the same extension surface as `EXT_state_series` while
+inheriting problems 1, 2, and 4 unchanged.
+
+**Normative guidance:** for quantities that *are* mutable, settable
+properties — camera/material/light parameters, physics initial conditions,
+drive commands — producers SHOULD use `KHR_animation_pointer` (or core
+animation) and SHOULD NOT mirror them as `EXT_state_series` channels.
+`EXT_state_series` is exclusively the *descriptive* plane: recorded,
+sampled observations.
+
 ### Registered kind vocabulary
 
 | `kind` | Width | Default units | `frame` | Notes |
 |---|---|---|---|---|
-| `linear_velocity` | 3 (VEC3) | `m/s` | **Required** | |
-| `angular_velocity` | 3 (VEC3) | `rad/s` | **Required** | See "Implementation Notes" on the cost of an ambiguous frame for this kind specifically. |
+| `linear_velocity` | 3 (VEC3) | `m/s` | **Required** | Measured/observed value — distinct from the *settable* `KHR_physics_rigid_bodies` `motion.linearVelocity` (an initial condition/command; see "Relationship to `KHR_animation_pointer`"). |
+| `angular_velocity` | 3 (VEC3) | `rad/s` | **Required** | Measured/observed value (same distinction as `linear_velocity`). See "Implementation Notes" on the cost of an ambiguous frame for this kind specifically. |
 | `applied_force` | 3 (VEC3) | `N` | **Required** | |
 | `applied_torque` | 3 (VEC3) | `N·m` | **Required** | |
 | `action` | Task-defined (A); chunked if A > 4 | Task-defined; producer MUST document units out-of-band (e.g. `extras`) | MUST NOT be present | `pointer` targets the active scene, not a per-object node, in the common case of a whole-episode action. |

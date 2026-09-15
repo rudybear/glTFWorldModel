@@ -66,7 +66,7 @@ img { display: block; margin-left: auto; margin-right: auto; }
 <ul>
 <li><strong>It works — via extensions.</strong> Standard glTF carries geometry and pose animation; draft Khronos physics extensions carry mass/friction/colliders/joints; everything else needed a custom extension we wrote (<code>EXT_state_series</code>, now a ballot-ready draft proposal)</li>
 <li><strong>glTF's superpower is distribution</strong>: one royalty-free spec, one validator with a hard &quot;passes ⇒ renders&quot; guarantee, many independent implementations, opens natively in any browser</li>
-<li><strong>glTF's blind spot is dynamic state</strong>: core glTF can animate only position/rotation/scale — velocities, joint angles, actions, and uncertainty have <em>no native home</em></li>
+<li><strong>glTF's blind spot is <em>recorded</em> state</strong>: animation — even via the ratified <code>KHR_animation_pointer</code>, which can time-vary any settable property — is <em>prescriptive</em>: players apply it. Measured velocities, actions, joint observations, and uncertainty need a <em>descriptive</em> channel consumers never execute — that had no home</li>
 <li>Cost of that blind spot, measured: 20 documented gaps, each with a workaround we had to build and validate ourselves</li>
 </ul>
 </section>
@@ -98,10 +98,11 @@ img { display: block; margin-left: auto; margin-right: auto; }
 ;" data-marpit-pagination-total="11">
 <h2 id="usd-in-2026-the-world-model-data-story--look-closely">USD in 2026: the world-model data story — look closely</h2>
 <ul>
-<li>USD attributes natively support <strong>timeSamples</strong> — time-varying values on <em>any</em> attribute. Architecturally, exactly what glTF lacks</li>
+<li>USD: <strong>timeSamples</strong> put time-varying values on <em>any</em> attribute — including custom ones invented ad hoc, no schema needed</li>
+<li>glTF: animation + ratified <code>KHR_animation_pointer</code> time-vary any <strong>settable</strong> property — but all of it <em>prescriptively</em>: there is <strong>no observation plane</strong>, and no properties exist for actions, uncertainty, or measurements</li>
 <li><strong>But no standard says what recorded simulation state should look like.</strong> AOUSD runs five working groups (Core Spec, Materials, Geometry, Marketing, Physics) — none for simulation state or ML data</li>
 <li>The revealing detail: <strong>NVIDIA's own PhysicalAI datasets</strong> ship USD/USDZ scenes with dynamic trajectories in <strong>companion JSON sidecar files</strong> — not USD timeSamples</li>
-<li><strong>Cosmos 3</strong> (NVIDIA's world foundation model, June 2026) consumes <strong>video + action tokens + language</strong> — USD appears upstream as the scene-authoring substrate that gets <em>rendered into</em> training video, not as the model's state format</li>
+<li><strong>Cosmos 3</strong> (NVIDIA's world foundation model, June 2026) consumes <strong>video + action tokens + language</strong> — USD sits upstream (scenes get <em>rendered into</em> training video), not as the model's state format</li>
 <li>We found <strong>no published ML pipeline using USD as the sim→train→inference state transport</strong> — the same &quot;nobody&quot; we found for glTF</li>
 </ul>
 </section>
@@ -173,7 +174,7 @@ img { display: block; margin-left: auto; margin-right: auto; }
 <tr>
 <td>Time-varying data plumbing</td>
 <td><strong>USD</strong></td>
-<td>native timeSamples on any attribute; glTF needs an extension</td>
+<td>timeSamples on any attribute, incl. custom; glTF + <code>KHR_animation_pointer</code> covers <em>settable</em> properties only — recorded observations still need an extension</td>
 </tr>
 <tr>
 <td>Physics maturity</td>
