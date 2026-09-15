@@ -1,0 +1,25 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "glTF.EXT_state_series.schema.json",
+    "title": "EXT_state_series glTF Document Extension",
+    "type": "object",
+    "description": "Draft KHR-track proposal extension carrying named, time-sampled, non-pose per-object state (velocity, applied force/torque, action, joint state, pose uncertainty) that rides alongside a standard glTF pose animation, sharing its time accessor. Channels target arbitrary glTF objects via JSON Pointer (RFC 6901), resolved with the same rules KHR_animation_pointer uses for its own `pointer` extension property. See ../README.md.",
+    "properties": {
+        "version": {
+            "type": "string",
+            "description": "EXT_state_series schema version, e.g. \"1.0.0-draft.1\"."
+        },
+        "timesAccessor": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Index of the shared time accessor (float32 seconds, SCALAR). MAY also be used as an AnimationSampler.input for a co-existing pose animation; if so, that sampler's interpolation MUST be STEP (see README, 'Shared time accessor and invariants')."
+        },
+        "channels": {
+            "type": "array",
+            "description": "The document's time-series channels.",
+            "items": { "$ref": "glTF.EXT_state_series.channel.schema.json" }
+        }
+    },
+    "required": ["version", "timesAccessor", "channels"],
+    "additionalProperties": false
+}
